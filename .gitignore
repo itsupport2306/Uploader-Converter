@@ -1,0 +1,74 @@
+# Local environment and secrets
+.env
+.env.*
+env*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated process output
+generated_docx/
+generated_docx_test/
+complete_process_manifest.jsonl
+complete_process_test_manifest.jsonl
+data_upload_manifest.jsonl
+*.tmp
+
+# Build/package artifacts
+build/
+dist/
+dist.zip
+*.zip
+*.spec.bak
+
+# Converter generated/sample data and output
+Converter/**/build/
+Converter/**/dist/
+Converter/**/dist.zip
+Converter/**/Output/*
+!Converter/**/Output/.gitkeep
+Converter/**/SS/
+Converter/**/doximity_ss/
+Converter/**/*.docx
+Converter/**/*.pdf
+Converter/**/*.xlsx
+Converter/**/*.xlsm
+Converter/**/*.csv
+Converter/**/*.png
+Converter/**/*.jpg
+Converter/**/*.jpeg
+Converter/**/*.webp
+Converter/**/*.bmp
+Converter/**/*.tif
+Converter/**/*.tiff
+Converter/**/*.stackdump
+
+# Converter checkpoints and local state
+.converter_state/
+Converter/**/.converter_state/
+Converter/**/.venv/
+Converter/**/__pycache__/
+
+# Logs
+*.log
+logs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+D:\Radixsol\Converter\Converter\Converter\Output
+Output/

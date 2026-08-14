@@ -1,0 +1,60 @@
+# Local environment and secrets
+.env
+.env.*
+env*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PyInstaller/build output
+build/
+dist/
+dist.zip
+*.spec.bak
+
+# Converter runtime output and local state
+Output/*
+Converter/Output/*
+!Output/.gitkeep
+!Converter/Output/.gitkeep
+Converter/SS/
+Converter/doximity_ss/
+.converter_state/
+Converter/.converter_state/
+*.tmp
+*.log
+*.stackdump
+
+# Generated documents and local datasets
+*.docx
+*.pdf
+*.xlsx
+*.xlsm
+*.csv
+
+# Screenshots/images used as local batch input
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.tif
+*.tiff
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
