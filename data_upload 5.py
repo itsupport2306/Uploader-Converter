@@ -22,6 +22,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SUPPORTED = {".pdf", ".docx"}
 DEFAULT_PREFIX = "resumes/import"
 DEFAULT_MANIFEST = "data_upload_manifest.jsonl"
+DEFAULT_ENV_FILE = "env 1" if (SCRIPT_DIR / "env 1").exists() else ".env"
 
 PIP_PACKAGES = {
     "sqlalchemy": "sqlalchemy",
@@ -120,29 +121,19 @@ def _append_env_values(env_path: Path, values: dict[str, str]) -> None:
 
 
 def _prepare_runtime_env(args: argparse.Namespace) -> None:
-    env_file = getattr(args, "env_file", ".env")
+    env_file = getattr(args, "env_file", DEFAULT_ENV_FILE)
     _load_env(env_file)
     if getattr(args, "dry_run", False):
         return
 
-    env_updates: dict[str, str] = {}
     for key, value in DEFAULT_UPLOAD_ENV.items():
         if key not in os.environ:
             os.environ[key] = value
-            env_updates[key] = value
 
     missing = [(k, label, secret) for k, label, secret in REQUIRED_UPLOAD_ENV if not os.environ.get(k)]
     if missing:
-        print("Enter upload credentials. Secrets are hidden while typing.")
-    for key, label, secret in missing:
-        value = _prompt_env_value(key, label, secret)
-        os.environ[key] = value
-        env_updates[key] = value
-
-    if env_updates and not getattr(args, "no_save_credentials", False):
-        answer = input(f"Save these settings to {_env_path(env_file)} for future runs? [y/N]: ")
-        if answer.strip().lower() in {"y", "yes"}:
-            _append_env_values(_env_path(env_file), env_updates)
+        keys = ", ".join(key for key, _label, _secret in missing)
+        raise SystemExit(f"ERROR: Missing required environment setting(s) in {_env_path(env_file)}: {keys}")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1526,8 +1517,8 @@ def main() -> int:
     parser.add_argument("--prefix", default=DEFAULT_PREFIX, help="R2 key prefix")
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST, help="JSONL progress manifest path")
     parser.add_argument("--ignore-manifest", action="store_true", help="Do not skip hashes in manifest")
-    parser.add_argument("--env-file", default=".env", help="Env file path, relative to this script by default")
-    parser.add_argument("--no-save-credentials", action="store_true", help="Do not offer to save prompted credentials")
+    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE, help="Env file path, relative to this script by default")
+    parser.add_argument("--no-save-credentials", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--install-deps", action="store_true", help="Install missing Python packages, then continue")
     args = parser.parse_args()
 

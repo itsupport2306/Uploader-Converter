@@ -20,7 +20,7 @@ DEFAULT_OUTPUT_DIR = ROOT / "generated_docx"
 DEFAULT_PROCESS_MANIFEST = ROOT / "complete_process_profiles_manifest.jsonl"
 DEFAULT_UPLOAD_LOG = ROOT / "complete_process_upload_log.csv"
 DEFAULT_TARGET_TABLE = "profiles"
-DEFAULT_ENV_FILE = "env 1" if (ROOT / "env 1").exists() and not (ROOT / ".env").exists() else ".env"
+DEFAULT_ENV_FILE = "env 1" if (ROOT / "env 1").exists() else ".env"
 
 PROFILE_COLUMNS = {
     "profile_id", "user_id", "first_name", "last_name", "headline", "bio",
