@@ -372,6 +372,9 @@ def _name_from_filename(path: Path) -> tuple[str, str]:
 
 def _guess_name(text: str, path: Path) -> tuple[str, str]:
     for line in (ln.strip() for ln in text.splitlines()[:10]):
+        name = _name_from_comma_header(line)
+        if name:
+            return name
         name = _candidate_name_from_line(line)
         if name:
             return name
@@ -546,6 +549,13 @@ def _clean_specialty(value: str | None) -> str | None:
     text = _clean_text(value)
     if _is_noisy_card_text(text):
         return None
+    parts = [_clean_text(part) for part in text.split(",")]
+    parts = [part for part in parts if part]
+    for idx, part in enumerate(parts[:-1]):
+        if part.upper().replace(".", "") in CREDENTIALS:
+            text = ", ".join(parts[idx + 1:]).strip()
+            break
+    text = re.split(r"\s+\?\s+", text, maxsplit=1)[0].strip(" ?")
     return text[:100]
 
 
@@ -584,6 +594,45 @@ def _extract_location(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _specialty_from_compact_location_line(line: str, city: str | None, state_code: str | None) -> str | None:
+    """Extract specialty from lines like 'Oral Surgery Cape Elizabeth, ME'."""
+    if not (city and state_code):
+        return None
+    text = _clean_text(line)
+    city_state = f"{city}, {state_code}"
+    idx = text.lower().rfind(city_state.lower())
+    if idx <= 0:
+        return None
+    specialty = text[:idx].strip(" ,-|")
+    return _clean_specialty(specialty)
+
+
+def _specialty_from_comma_header(line: str) -> str | None:
+    """Extract specialty from headers like 'Jane Smith, MD, Pediatric Gastroenterology'."""
+    parts = [_clean_text(part) for part in str(line or "").split(",")]
+    parts = [part for part in parts if part]
+    if len(parts) < 3:
+        return None
+    credential = parts[1].upper().replace(".", "")
+    if credential not in CREDENTIALS and credential not in {"PA-C", "PA C"}:
+        return None
+    return _clean_specialty(parts[2])
+
+
+def _name_from_comma_header(line: str) -> tuple[str, str] | None:
+    parts = [_clean_text(part) for part in str(line or "").split(",")]
+    parts = [part for part in parts if part]
+    if len(parts) < 2:
+        return None
+    credential = parts[1].upper().replace(".", "")
+    if credential not in CREDENTIALS and credential not in {"PA-C", "PA C"}:
+        return None
+    tokens = _line_tokens_for_name(parts[0])
+    if 2 <= len(tokens) <= 5:
+        return _title_words(tokens[0]) or tokens[0], _title_words(tokens[-1]) or tokens[-1]
+    return None
+
+
 def _extract_years(text: str, fallback: int | None = None) -> int:
     value = int(fallback or 0)
     if value < 0 or value > 60:
@@ -610,10 +659,22 @@ def format_resume_fields(fields: dict, text: str, path: Path) -> dict:
         out["phone"] = phone_m.group(0)[:30]
     out["profession_type"] = (_extract_profession(text, out.get("profession_type")) or None)
     specialty = _clean_specialty(out.get("specialty")) or _detect(" " + text.lower() + " ", SPECIALTIES)
-    out["specialty"] = specialty[:100] if specialty else None
+    if not specialty:
+        for line in text.splitlines()[:8]:
+            specialty = _specialty_from_comma_header(line)
+            if specialty:
+                break
     parsed_city, parsed_state = _extract_location(text)
     city = _title_city(out.get("city")) or parsed_city
     state = _clean_state(out.get("state_code")) or parsed_state
+    if parsed_city and parsed_state and city == parsed_city:
+        state = parsed_state
+    if not specialty and city and state:
+        for line in text.splitlines()[:12]:
+            specialty = _specialty_from_compact_location_line(line, city, state)
+            if specialty:
+                break
+    out["specialty"] = specialty[:100] if specialty else None
     out["city"] = city[:120] if city else None
     out["state_code"] = state
     out["years_experience"] = _extract_years(text, out.get("years_experience"))
@@ -667,7 +728,7 @@ def parse_structured(text: str, path: Path) -> dict:
     for i in range(1, min(len(lines), 8)):
         match = LOCATION_RE.search(lines[i])
         if match:
-            specialty = match.group(1).strip()[:100]
+            specialty = _clean_specialty(match.group(1))
             city = match.group(2).strip()[:120]
             state_code = match.group(3).upper()
             loc_idx = i
@@ -713,6 +774,12 @@ def parse_structured(text: str, path: Path) -> dict:
 
     if state_code is None and licenses:
         state_code = licenses[0]["state_code"]
+
+    if not specialty and city and state_code:
+        for line in lines[1:min(len(lines), 8)]:
+            specialty = _specialty_from_compact_location_line(line, city, state_code)
+            if specialty:
+                break
 
     board_certs = [
         ln.strip()[:100] for ln in lines

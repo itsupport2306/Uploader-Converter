@@ -456,6 +456,7 @@ def is_footer(text: str) -> bool:
 
 
 _NAME_CRED = re.compile(r"\b(MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD)\b")
+_HEADER_CRED = re.compile(r"\b(MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD|MBA|MPH|MSc|MS|PhD)\b", re.I)
 
 
 def _looks_like_name(text: str) -> bool:
@@ -468,8 +469,56 @@ def _strip_leading_junk(text: str) -> str:
     """Remove a leading icon/OCR artifact from a header line (punctuation run or
     a short lowercase fragment sitting before the first real, capitalized word)."""
     text = re.sub(r"^\s*[^\w\s]+\s*", "", text)
+    duplicate = re.match(r"^([a-z][a-z.'-]{1,30})\s+([A-Z][A-Za-z.'-]*)(.*)$", text)
+    if duplicate and duplicate.group(1).casefold() == duplicate.group(2).casefold():
+        text = f"{duplicate.group(2)}{duplicate.group(3)}"
     text = re.sub(r"^([a-z]{1,3})\s+(?=[A-Z0-9])", "", text)
     return text.strip()
+
+
+def _name_words(text: str) -> list[str]:
+    words = []
+    for token in re.split(r"\s+", text.replace(",", " ")):
+        token = re.sub(r"[^A-Za-z'-]", "", token)
+        if not token or _HEADER_CRED.fullmatch(token):
+            continue
+        words.append(token)
+    return words
+
+
+def _strip_name_credential_prefix(text: str, title: str) -> str:
+    """Drop OCR/browser-title prefixes like 'Jazayeri, MD,' from specialties."""
+    words = _name_words(title)
+    if not words:
+        return text
+    escaped_names = [re.escape(words[-1])]
+    if len(words) >= 2:
+        escaped_names.append(re.escape(f"{words[0]} {words[-1]}"))
+    name_alt = "|".join(escaped_names)
+    cred = r"(?:MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD|MBA|MPH|MSc|MS|PhD)"
+    return re.sub(
+        rf"^\s*(?:{name_alt})\s*,\s*(?:{cred}\s*,\s*)+",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+
+
+def _subtitle_is_redundant(text: str, existing: list[str]) -> bool:
+    n = _norm(text)
+    if len(n) < 4:
+        return True
+    if text == text.lower() and len(n.split()) <= 3:
+        return True
+    if re.search(r"[“”]", text):
+        return True
+    for prev in existing:
+        pn = _norm(prev)
+        if n == pn:
+            return True
+        if len(n) <= 18 and n in pn:
+            return True
+    return False
 
 
 def match_heading(text: str) -> str | None:
@@ -516,13 +565,16 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
             title_line = max(name_lines, key=lambda ln: (ln.height, len(ln.text)))
         else:
             title_line = max(header_lines, key=lambda ln: ln.height)
-        blocks.append(Block("title", _strip_leading_junk(title_line.text)))
+        title = _strip_leading_junk(title_line.text)
+        blocks.append(Block("title", title))
+        subtitles: list[str] = []
         for ln in header_lines:
             if ln is title_line:
                 continue
-            sub = _strip_leading_junk(ln.text)
-            if len(_norm(sub)) > 3:        # skip tiny logo/icon remnants ("ov")
+            sub = _strip_name_credential_prefix(_strip_leading_junk(ln.text), title)
+            if len(_norm(sub)) > 3 and not _subtitle_is_redundant(sub, subtitles):
                 blocks.append(Block("subtitle", sub))
+                subtitles.append(sub)
 
     # --- Body: sections, sub-headings, and gap-separated entries -------------
     seen_heading = False
@@ -554,6 +606,15 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
             return
         head = entry[0].text
         details = [ln.text for ln in entry[1:]]
+        if details:
+            head_norm = _norm(head)
+            first_detail_norm = _norm(details[0])
+            if (
+                head_norm
+                and len(first_detail_norm) > len(head_norm)
+                and head_norm in first_detail_norm
+            ):
+                head = details.pop(0)
         blocks.append(Block("entry", head, details))
 
     for ln in body:
