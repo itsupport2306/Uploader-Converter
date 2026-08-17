@@ -16,7 +16,8 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 CONVERTER_DIR = ROOT / "Converter" / "Converter" / "Converter"
 UPLOAD_SCRIPT = ROOT / "data_upload 5.py"
-DEFAULT_OUTPUT_DIR = ROOT / "generated_docx"
+DEFAULT_OUTPUT_FOLDER_NAME = "generated_docx"
+DEFAULT_OUTPUT_PARENT_DIR = Path(r"C:\virinchi")
 DEFAULT_PROCESS_MANIFEST = ROOT / "complete_process_profiles_manifest.jsonl"
 DEFAULT_UPLOAD_LOG = ROOT / "complete_process_upload_log.csv"
 DEFAULT_TARGET_TABLE = "profiles"
@@ -121,6 +122,10 @@ def _record_id(path: Path) -> str:
 
 def _docx_path_for(image_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{image_path.stem}.docx"
+
+
+def _default_output_dir_for(input_path: Path) -> Path:
+    return DEFAULT_OUTPUT_PARENT_DIR / DEFAULT_OUTPUT_FOLDER_NAME
 
 
 def _quoted_table(name: str) -> str:
@@ -398,7 +403,7 @@ def run(args: argparse.Namespace) -> dict:
     uploader._validate_upload_env(args)
 
     input_path = Path(args.input).expanduser()
-    output_dir = Path(args.output_dir).expanduser()
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else _default_output_dir_for(input_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     screenshots = _iter_screenshots(input_path, args.limit)
@@ -476,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Convert screenshots to DOCX, insert profile data, upload DOCX to Cloudflare R2, and track retry status."
     )
     parser.add_argument("input", help="Screenshot image or folder of screenshot images")
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Folder for generated DOCX files")
+    parser.add_argument("--output-dir", help=f"Folder for generated DOCX files, default: {DEFAULT_OUTPUT_FOLDER_NAME} inside the input folder")
     parser.add_argument("--dry-run", action="store_true", help="Convert/parse only; do not write DB or upload")
     parser.add_argument("--limit", type=int, default=None, help="Only process first N screenshots")
     parser.add_argument("--prefix", default=uploader.DEFAULT_PREFIX, help="Cloudflare R2 key prefix")

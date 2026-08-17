@@ -16,7 +16,7 @@ For each screenshot record, the runner works in this order:
 
 1. Finds required screenshot records in the input file or folder.
 2. Skips records already marked `processed` or `skipped_duplicate` in `complete_process_manifest.jsonl`.
-3. Converts the screenshot into a local `.docx` file in `generated_docx`.
+3. Converts the screenshot into a local `.docx` file in `generated_docx` inside the input folder.
 4. Reads the generated `.docx` and extracts profile fields.
 5. Checks existing database identities once, then avoids duplicate records by NPI, email, or last name plus phone.
 6. Inserts the profile data into Neon.
@@ -92,10 +92,10 @@ python complete_process.py "C:\path\to\one_screenshot.png" --limit 1
 
 ## Verify The DOCX Was Created Correctly
 
-Check the configured output folder. By default it is:
+Check the configured output folder. By default it is created inside the input folder:
 
 ```text
-generated_docx
+C:\path\to\screenshots\generated_docx
 ```
 
 Open the generated `.docx` and confirm the physician name, specialty, headings, education, licensing, and publication sections look correct. The conversion logic is unchanged from the existing converter.
