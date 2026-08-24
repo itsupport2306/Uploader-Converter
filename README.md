@@ -1,30 +1,45 @@
 # Complete Screenshot to Cloudflare Upload Process
 
-This project now has a single runner, `complete_process.py`, that connects the existing screenshot-to-DOCX converter with the existing Neon database and Cloudflare R2 uploader.
+This project uses `complete_process.py` to connect the screenshot-to-DOCX converter with the Neon profile insert/update flow and the Cloudflare R2 resume upload.
 
 The converter logic is reused from `Converter/Converter/Converter/screenshot_to_word.py`. The upload and database helpers are reused from `data_upload 5.py`.
 
-## How The Complete Process Works
+## What It Does
 
-Run the process with one command:
+For each screenshot, the runner:
+
+1. Finds source images from either a local folder/file or a OneDrive/SharePoint shared folder URL.
+2. Converts the screenshot to DOCX.
+3. Extracts text and profile fields from that DOCX.
+4. Checks for an existing profile match by resume hash, NPI, email, or phone plus last name.
+5. Uploads the DOCX to Cloudflare R2.
+6. Inserts or updates the `profiles` row in Neon.
+
+## Input Modes
+
+### Local folder or file
 
 ```powershell
 python complete_process.py "C:\path\to\screenshots"
 ```
 
-For each screenshot record, the runner works in this order:
+This keeps the previous local staging behavior and writes generated `.docx` files to the configured output directory.
 
-1. Finds required screenshot records in the input file or folder.
-2. Skips records already marked `processed` or `skipped_duplicate` in `complete_process_manifest.jsonl`.
-3. Converts the screenshot into a local `.docx` file in `generated_docx` inside the input folder.
-4. Reads the generated `.docx` and extracts profile fields.
-5. Checks existing database identities once, then avoids duplicate records by NPI, email, or last name plus phone.
-6. Inserts the profile data into Neon.
-7. Uploads the generated `.docx` to Cloudflare R2.
-8. Saves the Cloudflare path or public URL in `profiles.resume_url`.
-9. Appends `processed`, `skipped_duplicate`, `failed`, or `would_process` status to the JSONL manifest.
+### OneDrive or SharePoint shared folder URL
 
-Failed records are not terminal, so running the same command again retries them.
+```powershell
+python complete_process.py "https://<your-share-link>" --onedrive-client-id "<app-client-id>" --onedrive-tenant common
+```
+
+For URL inputs:
+
+- Screenshot images are downloaded directly from Microsoft Graph.
+- DOCX conversion runs in memory.
+- DOCX upload to Cloudflare R2 runs from memory.
+- No local DOCX files are created.
+- Local manifest and upload-log files are disabled by default.
+
+If you still want a local manifest or CSV log for URL inputs, pass `--manifest <path>` and/or `--upload-log <path>`.
 
 ## Configuration
 
@@ -45,64 +60,79 @@ S3_PUBLIC=true
 S3_ACL=
 ```
 
-If `S3_PUBLIC=true` and `S3_PUBLIC_BASE_URL` is set, the database stores a full public URL. Otherwise it stores an internal path like `/files/resumes/import/...`.
+If `S3_PUBLIC=true` and `S3_PUBLIC_BASE_URL` is set, the database stores a full public URL. Otherwise it stores an internal path like `/files/resumes/...`.
 
-Tesseract OCR must also be installed for screenshot conversion. If it is not in a standard Windows location, pass:
+Tesseract OCR must also be installed. If it is not in a standard Windows location:
 
 ```powershell
 python complete_process.py "C:\path\to\screenshots" --tesseract "C:\path\to\tesseract.exe"
 ```
 
-Install Python dependencies:
+## OneDrive / SharePoint Auth
+
+Shared-folder URL inputs require a Microsoft Graph public client app registration.
+
+Use either:
+
+```powershell
+python complete_process.py "https://<your-share-link>" --onedrive-client-id "<app-client-id>" --onedrive-tenant common
+```
+
+or environment variables:
+
+```env
+ONEDRIVE_CLIENT_ID=<app-client-id>
+ONEDRIVE_TENANT=common
+```
+
+Notes:
+
+- `common` is usually the best starting value.
+- If your org requires a specific tenant, pass that tenant ID instead.
+- `--no-browser` prints the device-login URL/code without trying to open a browser.
+
+## Useful Commands
+
+Local input:
+
+```powershell
+python complete_process.py "C:\path\to\screenshots" --limit 10
+python complete_process.py "C:\path\to\screenshots" --force-convert
+python complete_process.py "C:\path\to\screenshots" --output-dir "C:\path\to\docx_out"
+python complete_process.py "C:\path\to\screenshots" --dry-run
+```
+
+OneDrive / SharePoint input:
+
+```powershell
+python complete_process.py "https://<your-share-link>" --onedrive-client-id "<app-client-id>" --onedrive-tenant common --dry-run
+python complete_process.py "https://<your-share-link>" --onedrive-client-id "<app-client-id>" --onedrive-tenant common --limit 5
+python complete_process.py "https://<your-share-link>" --onedrive-client-id "<app-client-id>" --onedrive-tenant common --manifest "complete_process_profiles_manifest.jsonl" --upload-log "complete_process_upload_log.csv"
+```
+
+Install dependencies:
 
 ```powershell
 python complete_process.py "C:\path\to\screenshots" --install-deps --dry-run --limit 1
 ```
 
-## Run The Full Process
+## Retry Behavior
 
-Process all screenshots in a folder:
+For local inputs, the default manifest is `complete_process_profiles_manifest.jsonl`, so reruns skip records already marked `processed` or `skipped_duplicate`.
 
-```powershell
-python complete_process.py "C:\path\to\screenshots"
-```
-
-Useful options:
+Examples:
 
 ```powershell
-python complete_process.py "C:\path\to\screenshots" --output-dir "C:\path\to\docx_out"
-python complete_process.py "C:\path\to\screenshots" --limit 10
-python complete_process.py "C:\path\to\screenshots" --prefix "resumes/import"
-python complete_process.py "C:\path\to\screenshots" --force-convert
+python complete_process.py "C:\path\to\screenshots" --retry-all
+python complete_process.py "C:\path\to\screenshots" --ignore-manifest
+python complete_process.py "C:\path\to\screenshots" --manifest none
 ```
 
-## Test With A Sample Record
+For OneDrive / SharePoint URL inputs, manifest tracking is off by default unless you explicitly pass `--manifest`.
 
-Use `--dry-run` first. This creates/parses the DOCX but does not write to Neon and does not upload to Cloudflare:
+## Verification
 
-```powershell
-python complete_process.py "C:\path\to\one_screenshot.png" --dry-run --limit 1
-```
-
-Then run the same sample against the real services:
-
-```powershell
-python complete_process.py "C:\path\to\one_screenshot.png" --limit 1
-```
-
-## Verify The DOCX Was Created Correctly
-
-Check the configured output folder. By default it is created inside the input folder:
-
-```text
-C:\path\to\screenshots\generated_docx
-```
-
-Open the generated `.docx` and confirm the physician name, specialty, headings, education, licensing, and publication sections look correct. The conversion logic is unchanged from the existing converter.
-
-## Verify The Database Upload
-
-In Neon or any Postgres client, check the inserted profile:
+Check the latest uploaded profile in Neon:
 
 ```sql
 SELECT profile_id, first_name, last_name, resume_url, source, created_at, updated_at
@@ -112,7 +142,7 @@ ORDER BY created_at DESC
 LIMIT 10;
 ```
 
-To check a specific Cloudflare key from the manifest:
+Check a specific uploaded object:
 
 ```sql
 SELECT profile_id, first_name, last_name, resume_url
@@ -120,68 +150,10 @@ FROM profiles
 WHERE resume_url LIKE '%<cloudflare_key_or_hash>%';
 ```
 
-Related certification, license, and specialty records are inserted into `certifications`, `licenses`, and `profile_skills` when the parser finds those values.
-
-## Verify The Cloudflare Upload
-
-Open `complete_process_manifest.jsonl` and find the latest record with:
-
-```json
-"status": "processed"
-```
-
-That record contains:
-
-```json
-"cloudflare_key": "resumes/import/...",
-"resume_url": "..."
-```
-
-Verify in Cloudflare R2 that the object exists at `cloudflare_key`. If `S3_PUBLIC=true`, open `resume_url` in a browser. If public access is disabled, use Cloudflare R2 or your application file-serving route to verify the object.
-
-## Check Succeeded Or Failed
-
-The command prints a final summary:
+The command prints a final summary like:
 
 ```text
-Summary: {'processed': 1, 'skipped': 0, 'failed': 0, 'total': 1}
+Summary: {'processed': 10, 'skipped': 0, 'failed': 0, 'total': 10}
 ```
 
-The manifest is append-only and keeps the latest status per source screenshot:
-
-```text
-complete_process_manifest.jsonl
-```
-
-Statuses:
-
-```text
-processed          DOCX created, database updated, Cloudflare upload complete
-failed             One step failed; error text is recorded
-skipped_duplicate  A matching person already exists in the database
-would_process      Dry-run result only
-```
-
-## Retry Failed Records
-
-Run the same command again:
-
-```powershell
-python complete_process.py "C:\path\to\screenshots"
-```
-
-Records already marked `processed` or `skipped_duplicate` are skipped. Records marked `failed` are retried automatically.
-
-To retry everything, including records already marked processed:
-
-```powershell
-python complete_process.py "C:\path\to\screenshots" --retry-all
-```
-
-To ignore the manifest completely:
-
-```powershell
-python complete_process.py "C:\path\to\screenshots" --ignore-manifest
-```
-
-Cloudflare keys are based on the generated DOCX hash. If the same DOCX was already uploaded, the uploader reuses the existing object instead of uploading a duplicate.
+Cloudflare keys are hash-based, so if the same DOCX already exists in R2, the upload step reuses the existing object instead of creating a duplicate.

@@ -317,14 +317,18 @@ def extract_text(path: Path) -> str:
         reader = pypdf.PdfReader(str(path))
         return "\n".join((page.extract_text() or "") for page in reader.pages)
     if suffix == ".docx":
-        docx = _import_or_exit("docx")
-        doc = docx.Document(str(path))
-        lines = [p.text for p in doc.paragraphs]
-        for table in doc.tables:
-            for row in table.rows:
-                lines.append(" ".join(c.text for c in row.cells))
-        return "\n".join(lines)
+        return extract_docx_text_bytes(path.read_bytes())
     raise ValueError(f"Unsupported resume type: {suffix} (use .pdf or .docx)")
+
+
+def extract_docx_text_bytes(data: bytes) -> str:
+    docx = _import_or_exit("docx")
+    doc = docx.Document(io.BytesIO(data))
+    lines = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            lines.append(" ".join(c.text for c in row.cells))
+    return "\n".join(lines)
 
 
 def classify_provider(profession_type=None, specialty=None, headline=None, title=None) -> str:
@@ -935,6 +939,19 @@ def _upload_if_needed(path: Path, key: str) -> str:
     return _url_for_key(key)
 
 
+def _upload_bytes_if_needed(data: bytes, key: str, *, content_type: str) -> str:
+    if _object_exists(key):
+        return _url_for_key(key)
+
+    extra = {"ContentType": content_type}
+    acl = os.environ.get("S3_ACL", "").strip()
+    if acl:
+        extra["ACL"] = acl
+
+    _s3_client().upload_fileobj(io.BytesIO(data), os.environ["S3_BUCKET"], key, ExtraArgs=extra)
+    return _url_for_key(key)
+
+
 # ---------------------------------------------------------------------------
 # Neon raw SQL
 
@@ -1242,6 +1259,10 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _key_for(path: Path, digest: str, prefix: str) -> str:

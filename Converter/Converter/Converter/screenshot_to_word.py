@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import csv
+import io
 import json
 import os
 import re
@@ -226,8 +227,11 @@ def configure_tesseract(explicit: str | None = None) -> None:
 # Image preprocessing
 # --------------------------------------------------------------------------- #
 
-def load_image(path: Path, scale: float) -> Image.Image:
-    img = Image.open(path).convert("RGB")
+def load_image(path: Path | str | bytes | bytearray, scale: float) -> Image.Image:
+    if isinstance(path, (bytes, bytearray)):
+        img = Image.open(io.BytesIO(path)).convert("RGB")
+    else:
+        img = Image.open(path).convert("RGB")
     if scale and abs(scale - 1.0) > 1e-3:
         img = img.resize(
             (int(img.width * scale), int(img.height * scale)), Image.LANCZOS
@@ -679,7 +683,7 @@ def _add_bottom_border(paragraph):
     pPr.append(borders)
 
 
-def render_docx(blocks: list[Block], out_path: Path) -> None:
+def _build_document(blocks: list[Block]) -> Document:
     doc = Document()
 
     # Base style.
@@ -726,7 +730,19 @@ def render_docx(blocks: list[Block], out_path: Path) -> None:
             p = doc.add_paragraph()
             _set_run(p.add_run(block.text), size=11, color=COLOR_TEXT)
 
+    return doc
+
+
+def render_docx(blocks: list[Block], out_path: Path) -> None:
+    doc = _build_document(blocks)
     doc.save(str(out_path))
+
+
+def render_docx_bytes(blocks: list[Block]) -> bytes:
+    doc = _build_document(blocks)
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -1523,6 +1539,42 @@ def convert_tabular(
 # Orchestration
 # --------------------------------------------------------------------------- #
 
+def _analyze_image(
+    image_source: Path | str | bytes | bytearray,
+    *,
+    source_name: str,
+    scale: float = 1.5,
+    cutoff_ratio: float = 0.66,
+    keep_promo: bool = False,
+    min_conf: int = 35,
+    debug: bool = False,
+) -> list[Block]:
+    img = load_image(image_source, scale)
+    img, header_end = deinvert_dark_header(img)
+
+    # First pass on the full image to locate the column divider.
+    full_words = ocr_words(img, psm=3, min_conf=35)
+    cutoff = find_column_cutoff(full_words, img.width, header_end, cutoff_ratio)
+
+    # Crop to the main column and OCR as a single column. The confidence floor is
+    # kept moderate: the entry logos OCR into low-confidence junk that is normal
+    # height and tight to the text, so it can't be cleaned up downstream.
+    main = img.crop((0, 0, cutoff, img.height))
+    words = ocr_words(main, psm=4, min_conf=min_conf)
+    lines = group_lines(words, header_end)
+    blocks = build_blocks(lines, header_end, keep_promo)
+
+    if debug:
+        print(f"\n=== {source_name} ===")
+        print(f"header_end={header_end}  cutoff={cutoff}/{img.width}  "
+              f"lines={len(lines)} blocks={len(blocks)}")
+        for b in blocks:
+            print(f"  [{b.kind:10}] {b.text[:70]}")
+            for d in b.details:
+                print(f"               - {d[:66]}")
+
+    return blocks
+
 def convert(
     image_path: Path,
     out_path: Path,
@@ -1533,35 +1585,42 @@ def convert(
     min_conf: int = 35,
     debug: bool = False,
 ) -> Path:
-    img = load_image(image_path, scale)
-    img, header_end = deinvert_dark_header(img)
-
-    # First pass on the full image to locate the column divider.
-    full_words = ocr_words(img, psm=3, min_conf=35)
-    cutoff = find_column_cutoff(full_words, img.width, header_end, cutoff_ratio)
-
-    # Crop to the main column and OCR as a single column. The confidence floor is
-    # kept moderate: the entry logos OCR into low-confidence junk that is normal
-    # height and tight to the text, so it can't be cleaned up downstream — letting
-    # it in (min_conf 0) adds far more noise than the rare faint token it recovers.
-    main = img.crop((0, 0, cutoff, img.height))
-    words = ocr_words(main, psm=4, min_conf=min_conf)
-    lines = group_lines(words, header_end)
-    blocks = build_blocks(lines, header_end, keep_promo)
-
-    if debug:
-        print(f"\n=== {image_path.name} ===")
-        print(f"header_end={header_end}  cutoff={cutoff}/{img.width}  "
-              f"lines={len(lines)} blocks={len(blocks)}")
-        for b in blocks:
-            print(f"  [{b.kind:10}] {b.text[:70]}")
-            for d in b.details:
-                print(f"               - {d[:66]}")
+    blocks = _analyze_image(
+        image_path,
+        source_name=image_path.name,
+        scale=scale,
+        cutoff_ratio=cutoff_ratio,
+        keep_promo=keep_promo,
+        min_conf=min_conf,
+        debug=debug,
+    )
 
     # Write to a temp file then atomically rename, so a run killed mid-write
     # never leaves a partial .docx that a later resume would wrongly skip.
     _write_docx_atomic(blocks, out_path)
     return out_path
+
+
+def convert_bytes(
+    image_bytes: bytes,
+    source_name: str,
+    *,
+    scale: float = 1.5,
+    cutoff_ratio: float = 0.66,
+    keep_promo: bool = False,
+    min_conf: int = 35,
+    debug: bool = False,
+) -> bytes:
+    blocks = _analyze_image(
+        image_bytes,
+        source_name=source_name,
+        scale=scale,
+        cutoff_ratio=cutoff_ratio,
+        keep_promo=keep_promo,
+        min_conf=min_conf,
+        debug=debug,
+    )
+    return render_docx_bytes(blocks)
 
 
 def iter_inputs(input_path: Path):

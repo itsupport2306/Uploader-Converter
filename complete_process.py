@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import importlib.util
 import json
 import os
 import re
 import sys
+import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
-import uuid
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +28,10 @@ DEFAULT_PROCESS_MANIFEST = ROOT / "complete_process_profiles_manifest.jsonl"
 DEFAULT_UPLOAD_LOG = ROOT / "complete_process_upload_log.csv"
 DEFAULT_TARGET_TABLE = "profiles"
 DEFAULT_ENV_FILE = "env 1" if (ROOT / "env 1").exists() else ".env"
+DEFAULT_ONEDRIVE_TENANT = os.environ.get("ONEDRIVE_TENANT", "common")
+DEFAULT_ONEDRIVE_CLIENT_SECRET = os.environ.get("ONEDRIVE_CLIENT_SECRET")
+DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+GRAPH_APP_SCOPE = "https://graph.microsoft.com/.default"
 
 PROFILE_COLUMNS = {
     "profile_id", "user_id", "first_name", "last_name", "headline", "bio",
@@ -36,6 +46,58 @@ PROFILE_COLUMNS = {
     "captured_at", "screen_reason", "screen_score", "screened_at",
     "merged_into", "merged_at",
 }
+
+
+@dataclass(frozen=True)
+class ScreenshotSource:
+    record_id: str
+    source_file: str
+    display_name: str
+    docx_name: str
+    local_path: Path | None = None
+    remote_drive_id: str | None = None
+    remote_item_id: str | None = None
+
+    @property
+    def is_remote(self) -> bool:
+        return self.remote_drive_id is not None and self.remote_item_id is not None
+
+
+class ConfidentialOneDriveClient:
+    def __init__(self, *, client_id: str, tenant: str, client_secret: str):
+        self.client_id = client_id
+        self.tenant = tenant.strip().strip("/") or "common"
+        self.client_secret = client_secret
+        self.access_token = ""
+        self.refresh_token = ""
+        self.expires_at = 0.0
+
+    @property
+    def oauth_base_url(self) -> str:
+        tenant = quote(self.tenant, safe="")
+        return f"{converter.MICROSOFT_LOGIN_BASE_URL}/{tenant}/oauth2/v2.0"
+
+    def authenticate(self) -> None:
+        token = converter._post_form(
+            f"{self.oauth_base_url}/token",
+            {
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "scope": GRAPH_APP_SCOPE,
+            },
+        )
+        self._set_token(token)
+        print("OneDrive app login complete.")
+
+    def _set_token(self, token: dict) -> None:
+        self.access_token = token["access_token"]
+        self.expires_at = time.time() + int(token.get("expires_in", 3600))
+
+    def _ensure_token(self) -> None:
+        if self.access_token and time.time() < self.expires_at - 120:
+            return
+        self.authenticate()
 
 
 def _load_module(name: str, path: Path):
@@ -82,9 +144,9 @@ def _append_upload_log(path: Path, record: dict) -> None:
         writer.writerow({column: record.get(column) for column in columns})
 
 
-def _latest_manifest_status(path: Path) -> dict[str, dict]:
+def _latest_manifest_status(path: Path | None) -> dict[str, dict]:
     latest: dict[str, dict] = {}
-    if not path.exists():
+    if path is None or not path.exists():
         return latest
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
@@ -98,24 +160,6 @@ def _latest_manifest_status(path: Path) -> dict[str, dict]:
     return latest
 
 
-def _iter_screenshots(input_path: Path, limit: int | None) -> list[Path]:
-    if input_path.is_file():
-        if input_path.suffix.lower() not in IMAGE_EXTS:
-            supported = ", ".join(sorted(IMAGE_EXTS))
-            raise SystemExit(f"ERROR: unsupported input type: {input_path} (supported: {supported})")
-        files = [input_path]
-    elif input_path.is_dir():
-        files = sorted(
-            p for p in input_path.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-        )
-    else:
-        raise SystemExit(f"ERROR: input path not found: {input_path}")
-    if not files:
-        raise SystemExit(f"ERROR: no supported screenshots found in {input_path}")
-    return files[:limit] if limit else files
-
-
 def _record_id(path: Path) -> str:
     return str(path.resolve()).lower()
 
@@ -124,7 +168,7 @@ def _docx_path_for(image_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{image_path.stem}.docx"
 
 
-def _default_output_dir_for(input_path: Path) -> Path:
+def _default_output_dir_for(_: Path) -> Path:
     return DEFAULT_OUTPUT_PARENT_DIR / DEFAULT_OUTPUT_FOLDER_NAME
 
 
@@ -147,6 +191,237 @@ def _safe_cloudflare_segment(value: str | None) -> str:
 def _cloudflare_key_for(path: Path, digest: str, *segments: str | None) -> str:
     folder = _safe_cloudflare_segment(next((value for value in segments if value), None))
     return f"resumes/{folder}/{digest}{path.suffix.lower()}"
+
+
+def _is_remote_input(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _optional_local_path(value: str | None, default: Path | None) -> Path | None:
+    if value is None:
+        return default
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"none", "null", "off", "false", "-"}:
+        return None
+    return Path(normalized).expanduser()
+
+
+def _label_from_source(source: ScreenshotSource) -> str:
+    return Path(source.display_name).name or source.display_name
+
+
+def _virtual_docx_reference(source: ScreenshotSource) -> str:
+    docx_like = Path(source.display_name).with_suffix(".docx")
+    return f"memory://{docx_like.as_posix()}"
+
+
+def _iter_local_screenshots(input_path: Path, limit: int | None) -> list[ScreenshotSource]:
+    if input_path.is_file():
+        if input_path.suffix.lower() not in IMAGE_EXTS:
+            supported = ", ".join(sorted(IMAGE_EXTS))
+            raise SystemExit(f"ERROR: unsupported input type: {input_path} (supported: {supported})")
+        files = [input_path]
+    elif input_path.is_dir():
+        files = sorted(
+            p for p in input_path.rglob("*")
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+        )
+    else:
+        raise SystemExit(f"ERROR: input path not found: {input_path}")
+    if not files:
+        raise SystemExit(f"ERROR: no supported screenshots found in {input_path}")
+    selected = files[:limit] if limit else files
+    return [
+        ScreenshotSource(
+            record_id=_record_id(path),
+            source_file=str(path),
+            display_name=str(path),
+            docx_name=f"{path.stem}.docx",
+            local_path=path,
+        )
+        for path in selected
+    ]
+
+
+def _encode_share_url(shared_url: str) -> str:
+    encoded = base64.b64encode(shared_url.encode("utf-8")).decode("ascii")
+    return "u!" + encoded.rstrip("=").replace("/", "_").replace("+", "-")
+
+
+def _onedrive_request(
+    client,
+    method: str,
+    path_or_url: str,
+    *,
+    body: dict | bytes | None = None,
+    ok_statuses: set[int] | None = None,
+    headers: dict[str, str] | None = None,
+    content_type: str = "application/json",
+    expect_json: bool = True,
+):
+    data = None
+    if isinstance(body, dict):
+        data = json.dumps(body).encode("utf-8")
+    elif isinstance(body, bytes):
+        data = body
+
+    ok_statuses = ok_statuses or ({200, 201} if expect_json else {200})
+    retry_statuses = {429, 500, 502, 503, 504}
+    url = path_or_url if path_or_url.startswith(("http://", "https://")) else f"{converter.GRAPH_BASE_URL}{path_or_url}"
+
+    for attempt in range(1, 9):
+        client._ensure_token()
+        request_headers = {"Authorization": f"Bearer {client.access_token}"}
+        if headers:
+            request_headers.update(headers)
+        if data is not None:
+            request_headers.setdefault("Content-Type", content_type)
+        req = Request(url, data=data, headers=request_headers, method=method)
+        try:
+            with urlopen(req, timeout=60) as resp:
+                payload = resp.read()
+                status = getattr(resp, "status", resp.getcode())
+                if status not in ok_statuses:
+                    raise converter.OneDriveError(f"HTTP {status}", status=status)
+                if not expect_json:
+                    return payload
+                return json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
+        except HTTPError as exc:
+            parsed = converter._read_http_error(exc)
+            retry_after = None
+            header_value = exc.headers.get("Retry-After") if exc.headers else None
+            if header_value and header_value.isdigit():
+                retry_after = int(header_value)
+            error = converter.OneDriveError(
+                parsed["message"],
+                status=exc.code,
+                payload=parsed["payload"],
+                retry_after=retry_after,
+            )
+            if exc.code == 401 and client.refresh_token:
+                client.access_token = ""
+                continue
+            if exc.code in retry_statuses and attempt < 8:
+                wait = retry_after or min(120, 2 ** attempt)
+                print(
+                    f"OneDrive is busy/throttling (HTTP {exc.code}); "
+                    f"waiting {wait}s before retry {attempt + 1}/8..."
+                )
+                time.sleep(wait)
+                continue
+            raise error from exc
+        except URLError as exc:
+            raise converter.OneDriveError(f"Could not reach Microsoft endpoint: {exc}") from exc
+
+    raise converter.OneDriveError("Microsoft Graph request failed after retries")
+
+
+def _item_drive_id(item: dict) -> str:
+    parent = item.get("parentReference") or {}
+    drive_id = parent.get("driveId")
+    if drive_id:
+        return drive_id
+    remote_parent = (item.get("remoteItem") or {}).get("parentReference") or {}
+    drive_id = remote_parent.get("driveId")
+    if drive_id:
+        return drive_id
+    raise converter.OneDriveError(f"Missing driveId for OneDrive item: {item.get('name') or item.get('id')}")
+
+
+def _resolve_shared_item(client, shared_url: str) -> dict:
+    print("Resolving shared OneDrive/SharePoint link...")
+    token = _encode_share_url(shared_url)
+    item = _onedrive_request(
+        client,
+        "GET",
+        f"/shares/{token}/driveItem",
+        headers={"Prefer": "redeemSharingLink"},
+    )
+    item_name = item.get("name") or item.get("id") or "shared item"
+    item_kind = "folder" if "folder" in item else "file"
+    print(f"Resolved shared item: {item_name} ({item_kind})")
+    return item
+
+
+def _iter_drive_children(client, drive_id: str, item_id: str):
+    next_url = (
+        f"{converter.GRAPH_BASE_URL}/drives/{quote(drive_id, safe='')}"
+        f"/items/{quote(item_id, safe='')}/children?$top=200"
+    )
+    while next_url:
+        payload = _onedrive_request(client, "GET", next_url)
+        for item in payload.get("value", []):
+            yield item
+        next_url = payload.get("@odata.nextLink")
+
+
+def _walk_remote_images(
+    client,
+    item: dict,
+    *,
+    path_parts: list[str],
+    results: list[ScreenshotSource],
+    limit: int | None,
+) -> None:
+    if limit is not None and len(results) >= limit:
+        return
+
+    name = item.get("name") or item.get("id") or "item"
+    current_parts = path_parts + [name]
+
+    if "file" in item:
+        if Path(name).suffix.lower() in IMAGE_EXTS:
+            display_name = "/".join(current_parts)
+            results.append(
+                ScreenshotSource(
+                    record_id=f"onedrive://{_item_drive_id(item).lower()}/{str(item['id']).lower()}",
+                    source_file=item.get("webUrl") or display_name,
+                    display_name=display_name,
+                    docx_name=Path(display_name).with_suffix(".docx").name,
+                    remote_drive_id=_item_drive_id(item),
+                    remote_item_id=str(item["id"]),
+                )
+            )
+            if len(results) <= 5 or len(results) % 25 == 0:
+                print(f"Discovered {len(results)} image(s)... latest: {display_name}")
+        return
+
+    if "folder" not in item:
+        return
+
+    children = sorted(
+        _iter_drive_children(client, _item_drive_id(item), str(item["id"])),
+        key=lambda child: (child.get("name") or "").lower(),
+    )
+    for child in children:
+        _walk_remote_images(client, child, path_parts=current_parts, results=results, limit=limit)
+        if limit is not None and len(results) >= limit:
+            return
+
+
+def _iter_remote_screenshots(client, shared_url: str, limit: int | None) -> list[ScreenshotSource]:
+    root_item = _resolve_shared_item(client, shared_url)
+    print("Listing images from shared location...")
+    results: list[ScreenshotSource] = []
+    _walk_remote_images(client, root_item, path_parts=[], results=results, limit=limit)
+    if not results:
+        raise SystemExit(f"ERROR: no supported screenshots found in shared location: {shared_url}")
+    print(f"Finished listing shared location. Found {len(results)} supported image(s).")
+    return results
+
+
+def _download_remote_image_bytes(client, source: ScreenshotSource) -> bytes:
+    if not source.is_remote:
+        raise ValueError("Remote download requested for a local screenshot source.")
+    print(f"Downloading image: {source.display_name}")
+    return _onedrive_request(
+        client,
+        "GET",
+        f"/drives/{quote(source.remote_drive_id or '', safe='')}/items/{quote(source.remote_item_id or '', safe='')}/content",
+        expect_json=False,
+        ok_statuses={200},
+    )
 
 
 def _ensure_target_table(engine, table_name: str) -> None:
@@ -206,8 +481,8 @@ def _upsert_candidate(
     row_id: str | None,
     fields: dict,
     text: str,
-    image_path: Path,
-    docx_path: Path,
+    source_file: str,
+    docx_file: str,
     digest: str,
     key: str,
     resume_url: str,
@@ -217,8 +492,8 @@ def _upsert_candidate(
     profile_id = row_id or str(uuid.uuid4())
     resume_sections = {
         "raw_extracted_text": text,
-        "source_file": str(image_path),
-        "docx_file": str(docx_path),
+        "source_file": source_file,
+        "docx_file": docx_file,
         "docx_sha256": digest,
         "cloudflare_bucket": os.environ.get("S3_BUCKET"),
         "cloudflare_key": key,
@@ -311,38 +586,59 @@ def _upsert_candidate(
 
 def _process_one(
     *,
-    image_path: Path,
-    docx_path: Path,
+    source: ScreenshotSource,
+    output_dir: Path | None,
+    onedrive_client,
     engine,
-    seen_identity: dict,
     args: argparse.Namespace,
 ) -> dict:
-    record_id = _record_id(image_path)
+    docx_parse_path = Path(source.docx_name)
+    docx_reference = str(_docx_path_for(source.local_path, output_dir)) if source.local_path and output_dir else _virtual_docx_reference(source)
     base = {
-        "record_id": record_id,
-        "source_file": str(image_path),
-        "docx_file": str(docx_path),
+        "record_id": source.record_id,
+        "source_file": source.source_file,
+        "docx_file": docx_reference,
         "updated_at": _utc_iso(),
     }
 
-    if not docx_path.exists() or args.force_convert:
-        converter.convert(
-            image_path,
-            docx_path,
+    if source.is_remote:
+        image_bytes = _download_remote_image_bytes(onedrive_client, source)
+        print(f"Running OCR and DOCX conversion: {source.display_name}")
+        docx_bytes = converter.convert_bytes(
+            image_bytes,
+            source.display_name,
             scale=args.scale,
             cutoff_ratio=args.cutoff_ratio,
             keep_promo=args.keep_promo,
             min_conf=args.min_conf,
             debug=args.debug,
         )
+        digest = uploader._sha256_bytes(docx_bytes)
+        text = uploader.extract_docx_text_bytes(docx_bytes)
+    else:
+        if output_dir is None or source.local_path is None:
+            raise RuntimeError("Local processing requires a concrete output directory and source path.")
+        docx_path = _docx_path_for(source.local_path, output_dir)
+        base["docx_file"] = str(docx_path)
+        if not docx_path.exists() or args.force_convert:
+            converter.convert(
+                source.local_path,
+                docx_path,
+                scale=args.scale,
+                cutoff_ratio=args.cutoff_ratio,
+                keep_promo=args.keep_promo,
+                min_conf=args.min_conf,
+                debug=args.debug,
+            )
+        digest = uploader._sha256_file(docx_path)
+        text = uploader.extract_text(docx_path)
+        docx_bytes = None
 
-    digest = uploader._sha256_file(docx_path)
-    text = uploader.extract_text(docx_path)
-    fields = uploader.parse_resume_smart(text, docx_path)
+    fields = uploader.parse_resume_smart(text, docx_parse_path)
     label = f"{fields['first_name']} {fields['last_name']}"
     base["label"] = label
     key = _cloudflare_key_for(
-        docx_path,
+        docx_parse_path,
         digest,
         fields.get("provider_category"),
         fields.get("profession_type"),
@@ -369,11 +665,17 @@ def _process_one(
     if args.dry_run:
         return {**base, "status": "would_process"}
 
+    print(f"Checking existing profile match: {source.display_name}")
     with engine.begin() as conn:
         candidate_id = _existing_candidate_id(conn, args.target_table, fields, digest)
 
-    uploaded_url = uploader._upload_if_needed(docx_path, key)
+    if source.is_remote:
+        print(f"Uploading DOCX to Cloudflare R2: {source.display_name}")
+        uploaded_url = uploader._upload_bytes_if_needed(docx_bytes or b"", key, content_type=DOCX_CONTENT_TYPE)
+    else:
+        uploaded_url = uploader._upload_if_needed(Path(base["docx_file"]), key)
 
+    print(f"Upserting profile in Neon: {source.display_name}")
     with engine.begin() as conn:
         candidate_id = _upsert_candidate(
             conn,
@@ -381,8 +683,8 @@ def _process_one(
             row_id=candidate_id,
             fields=fields,
             text=text,
-            image_path=image_path,
-            docx_path=docx_path,
+            source_file=source.source_file,
+            docx_file=base["docx_file"],
             digest=digest,
             key=key,
             resume_url=uploaded_url,
@@ -398,77 +700,149 @@ def _process_one(
     }
 
 
+def _build_onedrive_client(args: argparse.Namespace):
+    if not args.onedrive_client_id:
+        raise SystemExit(
+            "ERROR: OneDrive/SharePoint URL inputs require --onedrive-client-id "
+            "or the ONEDRIVE_CLIENT_ID environment variable."
+        )
+
+    if args.onedrive_client_secret:
+        client = ConfidentialOneDriveClient(
+            client_id=args.onedrive_client_id,
+            tenant=args.onedrive_tenant,
+            client_secret=args.onedrive_client_secret,
+        )
+    else:
+        client = converter.OneDriveUploader(
+            client_id=args.onedrive_client_id,
+            tenant=args.onedrive_tenant,
+            remote_folder="",
+            upload_delay=0.0,
+            open_browser=not args.no_browser,
+        )
+
+    try:
+        client.authenticate()
+    except converter.OneDriveError as exc:
+        hint = ""
+        error_text = str(exc)
+        if "AADSTS50059" in error_text:
+            hint = (
+                "\nHint: Try --onedrive-tenant common or your Microsoft Entra tenant ID, "
+                "and confirm the app registration allows public client flows."
+            )
+        elif "AADSTS7000218" in error_text:
+            hint = (
+                "\nHint: pass --onedrive-client-secret with the secret value, "
+                "or enable public client flows and retry without a secret."
+            )
+        raise SystemExit(f"OneDrive login failed: {exc}{hint}") from exc
+    return client
+
+
 def run(args: argparse.Namespace) -> dict:
     uploader._prepare_runtime_env(args)
     uploader._validate_upload_env(args)
 
-    input_path = Path(args.input).expanduser()
-    output_dir = Path(args.output_dir).expanduser() if args.output_dir else _default_output_dir_for(input_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    remote_input = _is_remote_input(args.input)
+    manifest_path = _optional_local_path(args.manifest, None if remote_input else DEFAULT_PROCESS_MANIFEST)
+    upload_log_path = _optional_local_path(args.upload_log, None if remote_input else DEFAULT_UPLOAD_LOG)
 
-    screenshots = _iter_screenshots(input_path, args.limit)
-    latest = {} if args.ignore_manifest else _latest_manifest_status(Path(args.manifest))
+    if remote_input:
+        if args.output_dir:
+            raise SystemExit(
+                "ERROR: --output-dir is not supported for OneDrive/SharePoint URL inputs; "
+                "DOCX files are streamed directly without local staging."
+            )
+        onedrive_client = _build_onedrive_client(args)
+        screenshots = _iter_remote_screenshots(onedrive_client, args.input, args.limit)
+        output_dir = None
+        print("Input mode: OneDrive/SharePoint shared URL")
+        if manifest_path is None:
+            print("Local manifest disabled for remote input.")
+        if upload_log_path is None:
+            print("Local upload log disabled for remote input.")
+    else:
+        input_path = Path(args.input).expanduser()
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else _default_output_dir_for(input_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        onedrive_client = None
+        screenshots = _iter_local_screenshots(input_path, args.limit)
+
+    latest = {} if args.ignore_manifest else _latest_manifest_status(manifest_path)
     terminal_statuses = {"processed", "skipped_duplicate"}
     required = [
-        p for p in screenshots
-        if args.retry_all or latest.get(_record_id(p), {}).get("status") not in terminal_statuses
+        source for source in screenshots
+        if args.retry_all or latest.get(source.record_id, {}).get("status") not in terminal_statuses
     ]
 
     print(f"Found {len(screenshots)} screenshot(s); {len(required)} require processing.")
     if args.dry_run:
         print("Dry run: conversion and parsing only; no database writes or Cloudflare uploads.")
 
-    if any(not (_docx_path_for(p, output_dir).exists() and not args.force_convert) for p in required):
+    needs_conversion = bool(required) and (
+        remote_input
+        or any(
+            source.local_path is not None
+            and output_dir is not None
+            and not (_docx_path_for(source.local_path, output_dir).exists() and not args.force_convert)
+            for source in required
+        )
+    )
+    if needs_conversion:
         converter.configure_tesseract(args.tesseract)
 
     engine = None if args.dry_run else uploader._create_engine()
     if engine is not None:
         _ensure_target_table(engine, args.target_table)
-        seen_identity = {"npi": set(), "email": set(), "phone": set()}
         print(f'Target table: "{args.target_table}"')
-    else:
-        seen_identity = {"npi": set(), "email": set(), "phone": set()}
 
     stats = {"processed": 0, "skipped": 0, "failed": 0, "total": len(required)}
     started = monotonic()
-    manifest_path = Path(args.manifest)
-    upload_log_path = Path(args.upload_log)
 
-    for index, image_path in enumerate(required, start=1):
-        docx_path = _docx_path_for(image_path, output_dir)
+    for index, source in enumerate(required, start=1):
+        docx_reference = (
+            str(_docx_path_for(source.local_path, output_dir))
+            if source.local_path is not None and output_dir is not None
+            else _virtual_docx_reference(source)
+        )
         try:
             record = _process_one(
-                image_path=image_path,
-                docx_path=docx_path,
+                source=source,
+                output_dir=output_dir,
+                onedrive_client=onedrive_client,
                 engine=engine,
-                seen_identity=seen_identity,
                 args=args,
             )
-            _append_manifest(manifest_path, record)
+            if manifest_path is not None:
+                _append_manifest(manifest_path, record)
             status = record["status"]
             if status in {"processed", "would_process"}:
                 stats["processed"] += 1
-                if status == "processed":
+                if status == "processed" and upload_log_path is not None:
                     _append_upload_log(upload_log_path, record)
                 profile_note = f" -> {record.get('profile_id')}" if record.get("profile_id") else ""
-                print(f"[{index}/{len(required)}] {status.upper()} {record.get('label', image_path.stem)}{profile_note}")
+                print(f"[{index}/{len(required)}] {status.upper()} {record.get('label', _label_from_source(source))}{profile_note}")
             else:
                 stats["skipped"] += 1
-                print(f"[{index}/{len(required)}] SKIP {image_path.name}: {status}")
+                print(f"[{index}/{len(required)}] SKIP {_label_from_source(source)}: {status}")
         except Exception as exc:
             stats["failed"] += 1
             failed_record = {
-                "record_id": _record_id(image_path),
-                "source_file": str(image_path),
-                "docx_file": str(docx_path),
+                "record_id": source.record_id,
+                "source_file": source.source_file,
+                "docx_file": docx_reference,
                 "status": "failed",
                 "error": str(exc),
                 "updated_at": _utc_iso(),
                 "uploaded_at": _utc_iso(),
             }
-            _append_manifest(manifest_path, failed_record)
-            _append_upload_log(upload_log_path, failed_record)
-            print(f"[{index}/{len(required)}] FAIL {image_path.name}: {exc}", file=sys.stderr)
+            if manifest_path is not None:
+                _append_manifest(manifest_path, failed_record)
+            if upload_log_path is not None:
+                _append_upload_log(upload_log_path, failed_record)
+            print(f"[{index}/{len(required)}] FAIL {_label_from_source(source)}: {exc}", file=sys.stderr)
 
     elapsed = max(monotonic() - started, 0.001)
     print(f"\nSummary: {stats}")
@@ -480,14 +854,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Convert screenshots to DOCX, insert profile data, upload DOCX to Cloudflare R2, and track retry status."
     )
-    parser.add_argument("input", help="Screenshot image or folder of screenshot images")
-    parser.add_argument("--output-dir", help=f"Folder for generated DOCX files, default: {DEFAULT_OUTPUT_FOLDER_NAME} inside the input folder")
+    parser.add_argument("input", help="Local screenshot image/folder, or a OneDrive/SharePoint shared folder URL")
+    parser.add_argument("--output-dir", help=f"Folder for generated DOCX files for local inputs only; default: {DEFAULT_OUTPUT_FOLDER_NAME}")
     parser.add_argument("--dry-run", action="store_true", help="Convert/parse only; do not write DB or upload")
     parser.add_argument("--limit", type=int, default=None, help="Only process first N screenshots")
     parser.add_argument("--prefix", default=uploader.DEFAULT_PREFIX, help="Cloudflare R2 key prefix")
     parser.add_argument("--target-table", default=DEFAULT_TARGET_TABLE, help='Neon table for uploaded profiles, default "profiles"')
-    parser.add_argument("--manifest", default=str(DEFAULT_PROCESS_MANIFEST), help="JSONL process status manifest")
-    parser.add_argument("--upload-log", default=str(DEFAULT_UPLOAD_LOG), help="CSV log of uploaded profiles and lookup fields")
+    parser.add_argument("--manifest", default=None, help='JSONL process status manifest path. Use "none" to disable; disabled by default for OneDrive/SharePoint URL inputs.')
+    parser.add_argument("--upload-log", default=None, help='CSV log path. Use "none" to disable; disabled by default for OneDrive/SharePoint URL inputs.')
     parser.add_argument("--ignore-manifest", action="store_true", help="Do not skip records already marked processed")
     parser.add_argument("--retry-all", action="store_true", help="Retry every discovered record, including previously processed records")
     parser.add_argument("--force-convert", action="store_true", help="Regenerate DOCX even if it already exists")
@@ -499,6 +873,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cutoff-ratio", type=float, default=0.66, help="Fallback main-column width fraction")
     parser.add_argument("--min-conf", type=int, default=35, help="Minimum OCR confidence")
     parser.add_argument("--keep-promo", action="store_true", help="Keep Doximity promo/navigation lines")
+    parser.add_argument("--onedrive-client-id", default=os.environ.get("ONEDRIVE_CLIENT_ID"), help="Microsoft Graph client ID for OneDrive/SharePoint URL inputs")
+    parser.add_argument("--onedrive-client-secret", default=DEFAULT_ONEDRIVE_CLIENT_SECRET, help="Microsoft Graph client secret value for app-only OneDrive/SharePoint URL access")
+    parser.add_argument("--onedrive-tenant", default=DEFAULT_ONEDRIVE_TENANT, help="Microsoft tenant for OneDrive/SharePoint URL inputs. Use common or your tenant ID.")
+    parser.add_argument("--no-browser", action="store_true", help="Print the Microsoft device login URL/code without trying to open a browser")
     parser.add_argument("--debug", action="store_true", help="Print converter structure details")
     args = parser.parse_args(argv)
 
