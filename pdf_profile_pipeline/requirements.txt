@@ -1,0 +1,13 @@
+# PDF reading (text layer only; no conversion)
+pypdf>=4.0
+
+# Cloudflare R2 (S3-compatible) upload
+boto3>=1.34
+botocore>=1.34
+
+# Neon Postgres
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+
+# Microsoft Graph and the Qwen2.5 endpoint are called with the standard
+# library (urllib), so no HTTP client dependency is needed.

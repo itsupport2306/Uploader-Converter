@@ -1,0 +1,37 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+env*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Pipeline output and logs
+logs/
+*.log
+*.jsonl
+*.csv
+
+# Local PDF staging (source documents never belong in git)
+*.pdf
+pdfs/
+downloads/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
