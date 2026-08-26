@@ -44,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-all", action="store_true",
                         help="Reprocess every discovered PDF, including previously processed ones")
 
+    parser.add_argument("--ocr", action="store_true",
+                        help="OCR scanned/image-only PDFs (needs Tesseract) instead of skipping them")
     parser.add_argument("--no-llm", action="store_true",
                         help="Skip the Qwen2.5 call and use regex extraction only")
 

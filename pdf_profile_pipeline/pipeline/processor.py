@@ -64,13 +64,28 @@ def process_one(
 
     record.update({"pdf_sha256": digest, "pdf_pages": pages, "pdf_bytes": len(pdf_bytes)})
 
+    text_source = "pdf_text_layer"
+    if pdf_text.looks_empty(text) and getattr(args, "ocr", False):
+        # Image-only PDF: rasterise and OCR so the model still gets real text.
+        print(f"  no text layer; running OCR on {_label(source)} ({pages} page(s))...")
+        text = pdf_text.ocr_text(
+            pdf_bytes,
+            dpi=config.env_int("OCR_DPI", 300),
+            max_pages=config.env_int("OCR_MAX_PAGES", 0) or None,
+        )
+        text_source = "ocr"
+
+    record["text_source"] = text_source
+
     if pdf_text.looks_empty(text):
-        # Image-only PDF: no text layer to read, and converting it is out of scope.
-        return {
-            **record,
-            "status": "skipped_no_text",
-            "error": "PDF has no extractable text layer (likely a scanned image PDF).",
-        }
+        # Still nothing readable: either OCR is off, or the scan is unreadable.
+        detail = (
+            "PDF has no extractable text layer and OCR found no text."
+            if text_source == "ocr"
+            else "PDF has no extractable text layer (likely a scanned image PDF). "
+                 "Re-run with --ocr to read it."
+        )
+        return {**record, "status": "skipped_no_text", "error": detail}
 
     fields, mode, llm_error = _extract_fields(text, use_llm=args.use_llm)
     experience_detail = fields.pop("_experience_detail", {})
@@ -164,6 +179,12 @@ def run(args: argparse.Namespace) -> dict:
 
     args.use_llm = llm_extract.llm_enabled() and not args.no_llm
     config.validate_env(dry_run=args.dry_run, use_llm=args.use_llm)
+
+    if getattr(args, "ocr", False):
+        usable, reason = pdf_text.ocr_available()
+        if not usable:
+            raise SystemExit(f"ERROR: --ocr was requested but {reason}.")
+        print(f"OCR fallback: enabled ({pdf_text.tesseract_cmd()})")
 
     if args.use_llm:
         print(f"Extraction model: {llm_extract.model_name()} @ {os.environ.get('LLM_BASE_URL')}")

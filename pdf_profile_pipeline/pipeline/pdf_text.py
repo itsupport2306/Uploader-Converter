@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import io
+import os
 import re
+import shutil
+from pathlib import Path
 
 
 class PdfTextError(RuntimeError):
@@ -64,3 +67,77 @@ def normalize_text(text: str) -> str:
 
 def looks_empty(text: str, *, min_chars: int = 40) -> bool:
     return len(re.sub(r"\s", "", text or "")) < min_chars
+
+
+# --- OCR fallback for scanned/image-only PDFs -------------------------------
+#
+# Only used when the text layer is empty. Pages are rasterised in memory with
+# PyMuPDF and read with Tesseract; the PDF itself is still never modified.
+
+_WINDOWS_TESSERACT_PATHS = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+)
+
+
+def tesseract_cmd() -> str | None:
+    """Locate the Tesseract binary: TESSERACT_CMD, then PATH, then Program Files."""
+    configured = (os.environ.get("TESSERACT_CMD") or "").strip().strip('"')
+    if configured:
+        return configured if Path(configured).exists() else None
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    for candidate in _WINDOWS_TESSERACT_PATHS:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def ocr_available() -> tuple[bool, str]:
+    """Return (usable, reason) so callers can explain a disabled fallback."""
+    try:
+        import fitz  # noqa: F401, PLC0415
+    except ImportError:
+        return False, "PyMuPDF is not installed (pip install -r requirements.txt)"
+    try:
+        import pytesseract  # noqa: F401, PLC0415
+    except ImportError:
+        return False, "pytesseract is not installed (pip install -r requirements.txt)"
+    if not tesseract_cmd():
+        return False, (
+            "the Tesseract binary was not found; install it and set TESSERACT_CMD "
+            "if it is not on PATH"
+        )
+    return True, ""
+
+
+def ocr_text(pdf_bytes: bytes, *, dpi: int = 300, max_pages: int | None = None) -> str:
+    """Rasterise each page and read it with Tesseract. Returns normalised text."""
+    import fitz  # noqa: PLC0415
+    import pytesseract  # noqa: PLC0415
+    from PIL import Image  # noqa: PLC0415
+
+    command = tesseract_cmd()
+    if command:
+        pytesseract.pytesseract.tesseract_cmd = command
+
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise PdfTextError(f"Could not open PDF for OCR: {exc}") from exc
+
+    # 72 dpi is the PDF user-space unit, so this scales to the requested dpi.
+    matrix = fitz.Matrix(dpi / 72, dpi / 72)
+    chunks: list[str] = []
+    with document:
+        total = document.page_count if max_pages is None else min(document.page_count, max_pages)
+        for index in range(total):
+            try:
+                pixmap = document.load_page(index).get_pixmap(matrix=matrix)
+                image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+                chunks.append(pytesseract.image_to_string(image) or "")
+            except Exception as exc:
+                chunks.append("")
+                print(f"  warning: OCR failed on page {index + 1}: {exc}")
+    return normalize_text("\n".join(chunks))
