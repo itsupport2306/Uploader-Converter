@@ -102,6 +102,9 @@ def _call_model(messages: list[dict], *, timeout: int, temperature: float) -> st
         "messages": messages,
         "temperature": temperature,
         "stream": False,
+        # Too low and the JSON reply is cut off mid-object, which costs the
+        # whole extraction and silently drops the run to regex fallback.
+        "max_tokens": config.env_int("LLM_MAX_TOKENS", 1024),
         # Honoured by Ollama/vLLM; harmlessly ignored elsewhere.
         "response_format": {"type": "json_object"},
     }

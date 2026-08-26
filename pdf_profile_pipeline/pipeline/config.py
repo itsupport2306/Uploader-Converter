@@ -33,6 +33,7 @@ DEFAULT_ENV_VALUES = {
     "LLM_API_KEY": "ollama",
     "LLM_TIMEOUT_SECONDS": "180",
     "LLM_MAX_INPUT_CHARS": "18000",
+    "LLM_MAX_TOKENS": "1024",
     "LLM_TEMPERATURE": "0",
     "R2_KEY_PREFIX": "resumes",
     "TARGET_TABLE": "profiles",
