@@ -51,8 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Microsoft Graph client ID (or set ONEDRIVE_CLIENT_ID)")
     parser.add_argument("--onedrive-client-secret", default=os.environ.get("ONEDRIVE_CLIENT_SECRET"),
                         help="Client secret for app-only access (or set ONEDRIVE_CLIENT_SECRET)")
-    parser.add_argument("--onedrive-tenant", default=os.environ.get("ONEDRIVE_TENANT", "common"),
-                        help="Microsoft tenant: 'common' or your tenant ID")
+    parser.add_argument("--onedrive-tenant", default=None,
+                        help="Microsoft tenant: 'common' or your tenant ID (or set ONEDRIVE_TENANT)")
     parser.add_argument("--no-browser", action="store_true",
                         help="Print the device login URL/code instead of opening a browser")
     return parser
@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     config.load_env(args.env_file)
     args.onedrive_client_id = args.onedrive_client_id or os.environ.get("ONEDRIVE_CLIENT_ID")
     args.onedrive_client_secret = args.onedrive_client_secret or os.environ.get("ONEDRIVE_CLIENT_SECRET")
+    args.onedrive_tenant = args.onedrive_tenant or os.environ.get("ONEDRIVE_TENANT") or "common"
 
     default_run_log = config.ROOT / "logs" / f"run_{run_log.utc_iso().replace(':', '').replace('-', '')}.log"
     run_log_path = run_log.optional_path(args.run_log, default_run_log)
