@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from time import monotonic
@@ -14,6 +15,43 @@ from . import config, database, experience, llm_extract, pdf_text, run_log, shar
 from .sharepoint import PdfSource
 
 TERMINAL_STATUSES = {"processed", "skipped_duplicate"}
+
+# Words a resume file name carries around the candidate's actual name.
+_FILE_NAME_NOISE = {
+    "profile", "resume", "cv", "curriculum", "vitae", "copy", "final", "updated",
+    "new", "doc", "docx", "pdf", "indeed", "linkedin", "signed", "draft",
+}
+
+
+def _name_from_file_name(file_name: str | None) -> tuple[str, str] | None:
+    """'Donna-Omara-profile.pdf' -> ('Donna', 'Omara'). None if it is not a name."""
+    stem = Path(file_name or "").stem
+    words = [word for word in re.split(r"[^A-Za-z]+", stem) if len(word) > 1]
+    words = [word for word in words if word.lower() not in _FILE_NAME_NOISE]
+    if len(words) < 2:
+        return None
+    return words[0].capitalize(), words[1].capitalize()
+
+
+def validate_fields(fields: dict) -> tuple[bool, list[str]]:
+    """Gate the database write. Returns (ok, problems).
+
+    Only checks what the schema truly requires: first and last name are NOT NULL
+    in profiles, so a row without them cannot be written at all. Everything else
+    is reported as a note and still stored.
+    """
+    problems: list[str] = []
+    if not fields.get("first_name"):
+        problems.append("no first name could be extracted")
+    if not fields.get("last_name"):
+        problems.append("no last name could be extracted")
+
+    notes: list[str] = []
+    for label, key in (("city/state", "city"), ("bio", "bio"), ("work history", "positions")):
+        if not fields.get(key):
+            notes.append(f"no {label}")
+    fields["_validation_notes"] = notes
+    return not problems, problems
 
 
 def _extract_fields(text: str, *, use_llm: bool) -> tuple[dict, str, str | None]:
@@ -64,31 +102,55 @@ def process_one(
 
     record.update({"pdf_sha256": digest, "pdf_pages": pages, "pdf_bytes": len(pdf_bytes)})
 
+    # Extraction ladder: PDF text layer -> Tesseract OCR -> Qwen -> validation.
+    # Each rung only runs when the one above came up empty, and a failure at any
+    # rung is recorded rather than ending the record.
     text_source = "pdf_text_layer"
-    if pdf_text.looks_empty(text) and getattr(args, "ocr", False):
+    ocr_error = None
+    if pdf_text.looks_empty(text) and getattr(args, "ocr", True):
         # Image-only PDF: rasterise and OCR so the model still gets real text.
         print(f"  no text layer; running OCR on {_label(source)} ({pages} page(s))...")
-        text = pdf_text.ocr_text(
-            pdf_bytes,
-            dpi=config.env_int("OCR_DPI", 300),
-            max_pages=config.env_int("OCR_MAX_PAGES", 0) or None,
-        )
-        text_source = "ocr"
+        try:
+            text = pdf_text.ocr_text(
+                pdf_bytes,
+                dpi=config.env_int("OCR_DPI", 300),
+                max_pages=config.env_int("OCR_MAX_PAGES", 0) or None,
+            )
+            text_source = "ocr"
+            print(f"  OCR read {len(text)} character(s).")
+        except (pdf_text.TesseractError, pdf_text.PdfTextError) as exc:
+            # OCR is a fallback, not a gate: carry on with whatever text exists.
+            ocr_error = str(exc)
+            print(f"  warning: OCR failed: {exc}")
 
     record["text_source"] = text_source
-
-    if pdf_text.looks_empty(text):
-        # Still nothing readable: either OCR is off, or the scan is unreadable.
-        detail = (
-            "PDF has no extractable text layer and OCR found no text."
-            if text_source == "ocr"
-            else "PDF has no extractable text layer (likely a scanned image PDF). "
-                 "Re-run with --ocr to read it."
-        )
-        return {**record, "status": "skipped_no_text", "error": detail}
+    record["ocr_error"] = ocr_error
 
     fields, mode, llm_error = _extract_fields(text, use_llm=args.use_llm)
     experience_detail = fields.pop("_experience_detail", {})
+
+    # Last resort so an unreadable scan still lands as a real row: the source
+    # file name is genuine information about the candidate, unlike a guess.
+    if not (fields.get("first_name") and fields.get("last_name")):
+        derived = _name_from_file_name(source.file_name or source.display_name)
+        if derived:
+            fields.setdefault("_name_source", "file_name")
+            fields["first_name"] = fields.get("first_name") or derived[0]
+            fields["last_name"] = fields.get("last_name") or derived[1]
+            fields["full_name"] = fields.get("full_name") or " ".join(derived)
+            print(f"  no name in the text; using the file name: {' '.join(derived)}")
+
+    ok, problems = validate_fields(fields)
+    record["validation"] = problems
+    if not ok:
+        return {
+            **record,
+            "status": "skipped_unusable",
+            "error": "; ".join(problems),
+            "extraction_mode": mode,
+            "llm_error": llm_error,
+        }
+
     profile_id = database.profile_id_for(digest)
 
     key = storage.key_for(digest, fields.get("specialty"), fields.get("state_code"))
@@ -97,13 +159,24 @@ def process_one(
         "first_name": fields.get("first_name"),
         "last_name": fields.get("last_name"),
         "full_name": fields.get("full_name"),
+        "email": fields.get("email"),
+        "phone": fields.get("phone"),
         "city": fields.get("city"),
         "state_code": fields.get("state_code"),
+        "zip_code": fields.get("zip_code"),
+        "headline": fields.get("headline"),
         "specialty": fields.get("specialty"),
+        "profession_type": fields.get("profession_type"),
+        "work_authorization": fields.get("work_authorization"),
         "years_experience": fields.get("years_experience"),
         "years_experience_source": experience_detail.get("chosen_kind"),
         "years_experience_detail": experience_detail,
         "bio_chars": len(fields.get("bio") or ""),
+        "positions": len(fields.get("positions") or []),
+        "certifications": len(fields.get("certifications") or []),
+        "skills": len(fields.get("skills") or []),
+        "education_entries": len(fields.get("education") or []),
+        "languages": len(fields.get("languages") or []),
         "extraction_mode": mode,
         "llm_error": llm_error,
         "cloudflare_key": key,
@@ -127,8 +200,28 @@ def process_one(
         "cloudflare_bucket": os.environ.get("S3_BUCKET"),
         "cloudflare_key": key,
         "extraction_mode": mode,
+        "text_source": text_source,
         "experience_decision": experience_detail,
         "full_name": fields.get("full_name"),
+        # The structured resume content, kept alongside the flat columns.
+        "summary": fields.get("bio"),
+        "work_experience": fields.get("positions") or [],
+        "certifications": fields.get("certifications") or [],
+        "skills": fields.get("skills") or [],
+        "languages": fields.get("languages") or [],
+        "education": fields.get("education") or [],
+        "contact": {
+            "email": fields.get("email"),
+            "phone": fields.get("phone"),
+            "city": fields.get("city"),
+            "state_code": fields.get("state_code"),
+            "zip_code": fields.get("zip_code"),
+        },
+        "work_authorization": fields.get("work_authorization"),
+        "extraction_notes": fields.get("_validation_notes") or [],
+        "name_source": fields.get("_name_source") or "resume_text",
+        "ocr_error": ocr_error,
+        "llm_error": llm_error,
     }
 
     with engine.begin() as conn:
@@ -144,12 +237,16 @@ def process_one(
             resume_sections=resume_sections,
             resume_url=resume_url,
         )
+        work_added = database.sync_work_history(
+            conn, profile_id=stored_id, positions=fields.get("positions") or [],
+        )
 
     return {
         **record,
         "status": "processed",
         "profile_id": stored_id,
         "db_action": db_action,
+        "work_history_added": work_added,
         "uploaded_at": run_log.utc_iso(),
     }
 
@@ -180,11 +277,21 @@ def run(args: argparse.Namespace) -> dict:
     args.use_llm = llm_extract.llm_enabled() and not args.no_llm
     config.validate_env(dry_run=args.dry_run, use_llm=args.use_llm)
 
-    if getattr(args, "ocr", False):
-        usable, reason = pdf_text.ocr_available()
-        if not usable:
-            raise SystemExit(f"ERROR: --ocr was requested but {reason}.")
-        print(f"OCR fallback: enabled ({pdf_text.tesseract_cmd()})")
+    # Startup probe: actually run the binary, so a broken Tesseract is reported
+    # here once instead of as a per-page warning on every scanned PDF.
+    if getattr(args, "ocr", True):
+        usable, detail = pdf_text.selftest()
+        if usable:
+            print(f"OCR fallback: enabled - {detail}")
+        elif getattr(args, "require_ocr", False):
+            raise SystemExit(f"ERROR: --require-ocr was given but {detail}.")
+        else:
+            args.ocr = False
+            print(f"OCR fallback: DISABLED - {detail}")
+            print("  Scanned PDFs will fall back to the file name only. "
+                  "Fix Tesseract or pass --require-ocr to make this fatal.")
+    else:
+        print("OCR fallback: disabled (--no-ocr)")
 
     if args.use_llm:
         print(f"Extraction model: {llm_extract.model_name()} @ {os.environ.get('LLM_BASE_URL')}")

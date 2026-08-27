@@ -16,8 +16,9 @@ from . import config
 PROFILE_NAMESPACE = uuid.UUID("6f9b1a6e-6f0e-5f6b-9a0e-2f1c3d4e5a6b")
 
 REQUIRED_COLUMNS = {
-    "profile_id", "first_name", "last_name", "bio", "specialty",
-    "years_experience", "city", "state_code", "resume_url", "resume_sections",
+    "profile_id", "first_name", "last_name", "headline", "bio", "specialty",
+    "profession_type", "years_experience", "email", "phone", "city", "state_code",
+    "zip_code", "work_authorization", "education", "resume_url", "resume_sections",
     "completion_score", "search_text", "source", "created_at", "updated_at",
 }
 
@@ -78,32 +79,44 @@ def profile_id_for(digest: str) -> str:
 
 
 def find_existing_profile_id(conn, table_name: str, *, profile_id: str, digest: str, fields: dict) -> str | None:
-    """Match on the generated ID, then the PDF hash, then name + location."""
+    """Find the row this resume belongs to, so a rerun updates instead of duplicating.
+
+    Checked in order of confidence, each against an index:
+      1. the deterministic profile_id, which is itself derived from the PDF hash,
+         so this already covers "the same PDF was seen before";
+      2. email, which has a unique index and would otherwise raise on insert;
+      3. first + last name with the same city.
+    """
     table = quoted_table(table_name)
-    row = conn.execute(text_sql(f"""
-        SELECT profile_id
-        FROM {table}
-        WHERE profile_id = CAST(:profile_id AS TEXT)
-           OR resume_sections::text LIKE :digest_like
-           OR (
-                CAST(:first_name AS TEXT) IS NOT NULL
-                AND CAST(:last_name AS TEXT) IS NOT NULL
-                AND lower(first_name) = lower(CAST(:first_name AS TEXT))
-                AND lower(last_name) = lower(CAST(:last_name AS TEXT))
-                AND (
-                     CAST(:city AS TEXT) IS NULL
-                     OR lower(coalesce(city, '')) = lower(CAST(:city AS TEXT))
-                )
-           )
-        LIMIT 1
-    """), {
-        "profile_id": profile_id,
-        "digest_like": f"%{digest}%",
-        "first_name": fields.get("first_name"),
-        "last_name": fields.get("last_name"),
-        "city": fields.get("city"),
-    }).first()
-    return str(row[0]) if row else None
+
+    row = conn.execute(
+        text_sql(f"SELECT profile_id FROM {table} WHERE profile_id = :profile_id LIMIT 1"),
+        {"profile_id": profile_id},
+    ).first()
+    if row:
+        return str(row[0])
+
+    email = (fields.get("email") or "").strip().lower()
+    if email:
+        row = conn.execute(
+            text_sql(f"SELECT profile_id FROM {table} WHERE lower(email) = :email LIMIT 1"),
+            {"email": email},
+        ).first()
+        if row:
+            return str(row[0])
+
+    first, last, city = fields.get("first_name"), fields.get("last_name"), fields.get("city")
+    if first and last and city:
+        row = conn.execute(text_sql(f"""
+            SELECT profile_id FROM {table}
+            WHERE lower(first_name) = lower(:first_name)
+              AND lower(last_name) = lower(:last_name)
+              AND lower(coalesce(city, '')) = lower(:city)
+            LIMIT 1
+        """), {"first_name": first, "last_name": last, "city": city}).first()
+        if row:
+            return str(row[0])
+    return None
 
 
 def completion_score(fields: dict) -> int:
@@ -124,9 +137,13 @@ def completion_score(fields: dict) -> int:
 def search_text(fields: dict) -> str:
     parts = [
         fields.get("first_name"), fields.get("last_name"), fields.get("full_name"),
-        fields.get("specialty"), fields.get("city"), fields.get("state_code"),
-        fields.get("bio"),
+        fields.get("headline"), fields.get("specialty"), fields.get("profession_type"),
+        fields.get("city"), fields.get("state_code"), fields.get("bio"),
     ]
+    parts += [position.get("employer") for position in (fields.get("positions") or [])]
+    parts += [position.get("title") for position in (fields.get("positions") or [])]
+    parts += list(fields.get("certifications") or [])
+    parts += list(fields.get("skills") or [])
     return " ".join(str(part) for part in parts if part).lower()[:8000]
 
 
@@ -140,7 +157,12 @@ def upsert_profile(
     resume_sections: dict,
     resume_url: str,
 ) -> tuple[str, str]:
-    """Insert or update one profile row. Returns (profile_id, 'inserted'|'updated')."""
+    """Insert or update one profile row. Returns (profile_id, 'inserted'|'updated').
+
+    An update never destroys data: every optional column is written with
+    COALESCE(NULLIF(new, ''), existing), so a weaker rerun -- a failed model
+    call, a worse OCR pass -- can only add to a row, never blank it out.
+    """
     table = quoted_table(table_name)
     now = utcnow()
     row_id = existing_id or profile_id
@@ -148,12 +170,18 @@ def upsert_profile(
         "profile_id": row_id,
         "first_name": fields.get("first_name"),
         "last_name": fields.get("last_name"),
-        "headline": fields.get("specialty"),
+        "headline": fields.get("headline") or fields.get("specialty"),
         "bio": fields.get("bio"),
         "specialty": fields.get("specialty"),
+        "profession_type": fields.get("profession_type"),
         "years_experience": int(fields.get("years_experience") or 0),
+        "email": fields.get("email"),
+        "phone": fields.get("phone"),
         "city": fields.get("city"),
         "state_code": fields.get("state_code"),
+        "zip_code": fields.get("zip_code"),
+        "work_authorization": fields.get("work_authorization"),
+        "education": json.dumps(fields.get("education") or [], default=str),
         "resume_url": resume_url,
         "resume_sections": json.dumps(resume_sections, default=str),
         "completion_score": completion_score(fields),
@@ -168,18 +196,39 @@ def upsert_profile(
     if existing_id:
         conn.execute(text_sql(f"""
             UPDATE {table}
-            SET first_name = :first_name,
-                last_name = :last_name,
-                headline = :headline,
-                bio = :bio,
-                specialty = :specialty,
-                years_experience = :years_experience,
-                city = :city,
-                state_code = :state_code,
-                resume_url = :resume_url,
+            SET first_name = coalesce(nullif(:first_name, ''), first_name),
+                last_name = coalesce(nullif(:last_name, ''), last_name),
+                headline = coalesce(nullif(:headline, ''), headline),
+                -- The longer summary wins, so a truncated rerun cannot shrink it.
+                bio = CASE
+                        WHEN coalesce(CAST(:bio AS TEXT), '') = '' THEN bio
+                        WHEN bio IS NULL OR length(bio) <= length(CAST(:bio AS TEXT))
+                            THEN CAST(:bio AS TEXT)
+                        ELSE bio
+                      END,
+                specialty = coalesce(nullif(:specialty, ''), specialty),
+                profession_type = coalesce(nullif(:profession_type, ''), profession_type),
+                -- 0 means "not found this time", not "zero years".
+                years_experience = CASE
+                        WHEN CAST(:years_experience AS SMALLINT) > 0
+                            THEN CAST(:years_experience AS SMALLINT)
+                        ELSE years_experience
+                      END,
+                email = coalesce(nullif(:email, ''), email),
+                phone = coalesce(nullif(:phone, ''), phone),
+                city = coalesce(nullif(:city, ''), city),
+                state_code = coalesce(nullif(:state_code, ''), state_code),
+                zip_code = coalesce(nullif(:zip_code, ''), zip_code),
+                work_authorization = coalesce(nullif(:work_authorization, ''), work_authorization),
+                education = CASE
+                        WHEN CAST(:education AS TEXT) IN ('[]', 'null') THEN education
+                        ELSE CAST(:education AS JSON)
+                      END,
+                resume_url = coalesce(nullif(:resume_url, ''), resume_url),
                 resume_sections = CAST(:resume_sections AS JSON),
-                completion_score = :completion_score,
-                search_text = :search_text,
+                completion_score = greatest(
+                    coalesce(completion_score, 0), CAST(:completion_score AS SMALLINT)),
+                search_text = coalesce(nullif(:search_text, ''), search_text),
                 capture_source = :capture_source,
                 captured_at = :captured_at,
                 updated_at = :updated_at
@@ -190,13 +239,19 @@ def upsert_profile(
     inserted = conn.execute(text_sql(f"""
         INSERT INTO {table} (
             profile_id, first_name, last_name, headline, bio, specialty,
-            years_experience, city, state_code, open_to_work, resume_url,
+            profession_type, years_experience, email, phone, city, state_code,
+            zip_code, work_authorization, education, open_to_work, job_type_prefs,
+            resume_url,
             resume_sections, completion_score, search_text, source,
             capture_source, captured_at, created_at, updated_at
         )
         VALUES (
             :profile_id, :first_name, :last_name, :headline, :bio, :specialty,
-            :years_experience, :city, :state_code, TRUE, :resume_url,
+            :profession_type, :years_experience, nullif(:email, ''), :phone,
+            :city, :state_code, :zip_code, :work_authorization,
+            -- job_type_prefs is NOT NULL with no default, and a resume never
+            -- states one, so it starts empty for the candidate to fill in.
+            CAST(:education AS JSON), TRUE, CAST('[]' AS JSON), :resume_url,
             CAST(:resume_sections AS JSON), :completion_score, :search_text,
             CAST(:source AS profilesource),
             :capture_source, :captured_at, :created_at, :updated_at
@@ -204,3 +259,110 @@ def upsert_profile(
         RETURNING profile_id
     """), params).first()
     return str(inserted[0]), "inserted"
+
+
+# ---------------------------------------------------------------------------
+# work_history
+
+WORK_HISTORY_NAMESPACE = uuid.UUID("2c8f4b1d-7a3e-5c92-b0d6-1e4f8a7c3b52")
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def parse_month_year(raw) -> "date | None":
+    """'August 2025', '2025-08', '2013' -> a date. None when undatable.
+
+    A year-only value becomes 1 January of that year; the resume simply does not
+    say more than that, and inventing a month would be worse than a flat date.
+    """
+    from datetime import date  # noqa: PLC0415
+
+    text = str(raw or "").strip()
+    if not text or text.lower() in {"present", "current", "now", "none", "null"}:
+        return None
+    year_match = re.search(r"(19|20)\d{2}", text)
+    if not year_match:
+        return None
+    year = int(year_match.group(0))
+
+    month = 1
+    iso = re.match(r"^\s*(19|20)\d{2}[-/](\d{1,2})", text)
+    if iso:
+        month = max(1, min(12, int(iso.group(2))))
+    else:
+        name = re.search(r"[A-Za-z]{3,}", text)
+        if name:
+            month = _MONTHS.get(name.group(0)[:4].lower().rstrip("t"), _MONTHS.get(
+                name.group(0)[:3].lower(), 1))
+    try:
+        return date(year, month, 1)
+    except ValueError:
+        return None
+
+
+def work_id_for(profile_id: str, position: dict) -> str:
+    """Stable ID per (profile, employer, title, start), so reruns do not duplicate."""
+    key = "|".join(
+        re.sub(r"[^a-z0-9]+", "", str(position.get(field) or "").lower())
+        for field in ("employer", "title", "start_date")
+    )
+    return str(uuid.uuid5(WORK_HISTORY_NAMESPACE, f"{profile_id}:{key}"))
+
+
+def sync_work_history(conn, *, profile_id: str, positions: list[dict]) -> int:
+    """Insert this profile's positions, skipping ones already stored.
+
+    Existing rows are left alone rather than rewritten: a recruiter may have
+    corrected them by hand, and a rerun of the parser should not undo that.
+    """
+    if not positions:
+        return 0
+    if conn.execute(text_sql("SELECT to_regclass('public.work_history')")).scalar() is None:
+        return 0
+
+    existing = set(conn.execute(
+        text_sql("SELECT work_id FROM work_history WHERE profile_id = :profile_id"),
+        {"profile_id": profile_id},
+    ).scalars().all())
+
+    now = utcnow()
+    added = 0
+    seen: set[str] = set()
+    for position in positions:
+        employer = (position.get("employer") or "").strip()
+        title = (position.get("title") or "").strip()
+        # Both columns are NOT NULL, so a half-parsed entry cannot be stored.
+        if not employer or not title:
+            continue
+        work_id = work_id_for(profile_id, position)
+        if work_id in existing or work_id in seen:
+            continue
+        seen.add(work_id)
+        conn.execute(text_sql("""
+            INSERT INTO work_history (
+                work_id, profile_id, employer_name, job_title, specialty,
+                start_date, end_date, city, state_code, description, created_at
+            )
+            VALUES (
+                :work_id, :profile_id, :employer_name, :job_title, :specialty,
+                :start_date, :end_date, :city, :state_code, :description, :created_at
+            )
+            ON CONFLICT (work_id) DO NOTHING
+        """), {
+            "work_id": work_id,
+            "profile_id": profile_id,
+            "employer_name": employer[:255],
+            "job_title": title[:255],
+            "specialty": (position.get("specialty") or None),
+            "start_date": parse_month_year(position.get("start_date")),
+            "end_date": parse_month_year(position.get("end_date")),
+            "city": (position.get("city") or None),
+            "state_code": (position.get("state_code") or None),
+            "description": (position.get("description") or None),
+            "created_at": now,
+        })
+        added += 1
+    return added

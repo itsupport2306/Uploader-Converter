@@ -144,8 +144,9 @@ Every run writes three logs under `logs/` (all can be redirected or disabled):
 | `logs/upload_log.csv` | One row per record, spreadsheet-friendly: timestamp, status, profile ID, insert vs update, name, city/state, specialty, years and which signal produced them, PDF hash and pages, R2 key, whether the object was newly uploaded, resume URL, source file, extraction mode, error. |
 | `logs/run_<timestamp>.log` | The complete console transcript of the run. |
 
-Statuses you will see: `processed`, `would_process` (dry run), `skipped_no_text`
-(image-only PDF with no text layer), and `failed` with the error text.
+Statuses you will see: `processed`, `would_process` (dry run), `skipped_unusable`
+(no first/last name could be found, and those columns are `NOT NULL`), and
+`failed` with the error text.
 
 ## Reruns and Duplicates
 
@@ -200,9 +201,28 @@ pdf_profile_pipeline/
 
 ## Notes
 
-- Scanned, image-only PDFs have no text layer. They are logged as `skipped_no_text`
-  rather than converted, since conversion is deliberately out of scope here.
+- **Extraction order:** PDF text layer -> Tesseract OCR -> Qwen 2.5 -> validation ->
+  database. Each step only runs when the one before it came up empty, and a failure
+  at any step is recorded on the record rather than ending it. A PDF is never
+  dropped just for lacking a text layer.
+- **OCR is on by default.** Scanned, image-only PDFs are rasterised in memory with
+  PyMuPDF and read with Tesseract; the PDF itself is never modified. Use `--no-ocr`
+  to turn it off, or `--require-ocr` to make a broken Tesseract fatal instead of a
+  warning. At startup the pipeline runs `tesseract --version` and logs the binary
+  path, version and tessdata folder.
+- **Tesseract on Windows:** `TESSERACT_CMD` must point at `tesseract.exe`, but the
+  install *directory* is accepted too and resolved to the executable. Pointing it at
+  the folder is what produced `[WinError 5] Access is denied`: the path existed, so
+  it was passed to `CreateProcess`, which cannot execute a directory. If
+  `TESSERACT_CMD` is unset or wrong, the usual install locations are searched, and
+  `TESSDATA_PREFIX` is set automatically from the binary's own `tessdata` folder.
 - If the model is unreachable or returns unusable JSON, the run continues with regex
-  extraction and records `extraction_mode = regex_fallback` plus the model error.
+  extraction and records `extraction_mode = regex_fallback` plus the model error. A
+  reply cut off by the token limit is repaired rather than discarded.
+- Work history is written to `work_history`, one row per position, keyed by a
+  deterministic `work_id` so reruns never duplicate. Existing rows are left as they
+  are, so hand corrections survive a reparse.
+- Updates never destroy data: every optional column is merged with
+  `COALESCE(NULLIF(new, ''), existing)`, so a weaker rerun can only add to a row.
 - The `profiles` table must already exist in Neon with the expected columns; the
   pipeline validates this at startup and exits with a clear message if not.

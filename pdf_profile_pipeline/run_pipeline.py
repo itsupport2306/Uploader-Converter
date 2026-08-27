@@ -44,8 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-all", action="store_true",
                         help="Reprocess every discovered PDF, including previously processed ones")
 
-    parser.add_argument("--ocr", action="store_true",
-                        help="OCR scanned/image-only PDFs (needs Tesseract) instead of skipping them")
+    # OCR is on by default: a scanned resume must never be dropped for having
+    # no text layer. --no-ocr is the opt-out.
+    parser.add_argument("--ocr", action="store_true", default=True,
+                        help="OCR scanned/image-only PDFs with Tesseract (default: on)")
+    parser.add_argument("--no-ocr", dest="ocr", action="store_false",
+                        help="Do not OCR scanned PDFs; use the text layer only")
+    parser.add_argument("--require-ocr", action="store_true",
+                        help="Fail the run if Tesseract cannot be started, instead of continuing without it")
     parser.add_argument("--no-llm", action="store_true",
                         help="Skip the Qwen2.5 call and use regex extraction only")
 
