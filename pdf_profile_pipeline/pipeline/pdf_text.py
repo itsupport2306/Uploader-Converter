@@ -5,6 +5,7 @@ import io
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 
 
@@ -165,10 +166,23 @@ def tessdata_dir(command: str | None = None) -> str | None:
     return None
 
 
+# pytesseract keeps the binary path in a module global and TESSDATA_PREFIX is
+# process-wide, so two OCR workers configuring at once would race on both. The
+# value is identical either way, but the lock keeps a half-written path from
+# ever being read. The OCR call itself is thread-safe: pytesseract writes each
+# page to its own tempfile.mkstemp file and runs its own subprocess.
+_configure_lock = threading.Lock()
+
+
 def _configure_pytesseract():
     """Point pytesseract at the resolved binary and tessdata. Returns the module."""
     import pytesseract  # noqa: PLC0415
 
+    with _configure_lock:
+        return _configure_pytesseract_locked(pytesseract)
+
+
+def _configure_pytesseract_locked(pytesseract):
     command = tesseract_cmd()
     if not command:
         raise TesseractError(

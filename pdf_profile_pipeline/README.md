@@ -121,7 +121,7 @@ python run_pipeline.py "C:\path\to\pdfs" --no-llm
 | Flag | Purpose |
 | --- | --- |
 | `--limit N` | Process only the first N PDFs |
-| `--workers N` | Parallel download/extract/upload workers (default 1) |
+| `--workers N` | Parallel download/extract/upload workers (default 2, or `PIPELINE_WORKERS`) |
 | `--dry-run` | Read and extract only; no R2 upload, no database write |
 | `--no-llm` | Skip Qwen2.5 and use regex extraction only |
 | `--target-table` | Neon table to write (default `profiles`) |
@@ -187,7 +187,8 @@ pdf_profile_pipeline/
     config.py              .env loading, validation, settings
     sharepoint.py          Microsoft Graph auth, PDF discovery, download
     pdf_text.py            PDF text extraction (pypdf, in memory)
-    llm_extract.py         Qwen2.5 prompt, JSON parsing, regex fallback
+    llm_extract.py         Qwen2.5 prompts (3 passes), JSON parsing, regex fallback
+    schema.py              Type coercion, grounding checks, varchar clamping
     experience.py          Years-of-experience resolution
     storage.py             Cloudflare R2 upload of the original PDF
     database.py            Neon profile insert/update
@@ -201,6 +202,41 @@ pdf_profile_pipeline/
 
 ## Notes
 
+- **Three extraction passes, not one.** Qwen2.5-1.5B given the whole profile
+  schema in a single request drops `specialty`, truncates the headline at the
+  dash, and runs out of output tokens partway through the positions array. The
+  resume is split into its header block, its work history (chunked on job
+  boundaries) and its list sections, and each is asked for on its own with a
+  short schema. A pass that fails costs only its own section.
+- **Valid JSON by construction.** Each call sends a `json_schema`
+  `response_format`, which llama.cpp compiles into a sampling grammar. Servers
+  that reject it drop to `json_object` for the rest of the run, and a repair
+  layer still handles code fences, trailing commas, `//` comments, Python
+  literals and replies cut off mid-object.
+- **The header block is the source of truth for identity.** A job-board profile
+  PDF opens with three fixed lines, and they are read positionally:
+
+      Donna Omara                                <- full_name -> first + last
+      Infant room teacher - Creme de la Creme    <- specialty - current employer
+      Mount Pleasant, SC                         <- city, state_code
+
+  `headline` keeps that whole middle line; `specialty` is the part before the
+  dash and `current_employer` the part after it (stored in `resume_sections`,
+  since `profiles` has no column for it). The specialty is copied verbatim --
+  it is *not* widened into a category like "Early Childhood Education". A
+  resume that states `Specialty: X` outright wins over the line, and a keyword
+  fallback only runs when there is no headline line at all.
+- **Nothing invented.** Every extracted text value is checked against the words
+  in the resume before it is stored; one the resume does not support is dropped
+  and refilled from the regex pass, or left `NULL`. `resume_sections.schema_notes`
+  records each drop.
+- **Two workers by default.** Threads, not processes: the work is I/O bound.
+  Each worker takes its own pooled Neon connection, the boto3 client is built
+  once under a lock, the manifest and CSV are written under a lock, OCR runs in
+  its own subprocess with its own temp files, and model calls pass through a
+  semaphore (`LLM_MAX_CONCURRENCY`, default 1) because llama.cpp serves one
+  request per slot. Each record's progress lines are buffered and printed as
+  one block so two workers cannot interleave their output.
 - **Extraction order:** PDF text layer -> Tesseract OCR -> Qwen 2.5 -> validation ->
   database. Each step only runs when the one before it came up empty, and a failure
   at any step is recorded on the record rather than ending it. A PDF is never

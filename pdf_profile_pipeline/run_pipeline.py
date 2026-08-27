@@ -27,7 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=config.DEFAULT_ENV_FILE,
                         help="Env file path; relative paths resolve next to this script")
     parser.add_argument("--limit", type=int, default=None, help="Process only the first N PDFs")
-    parser.add_argument("--workers", type=int, default=1, help="Parallel workers for download/extract/upload")
+    # Two by default: one record's OCR or R2 upload overlaps the other's model
+    # call. Raise it only if the model server has more than one slot.
+    parser.add_argument("--workers", type=int,
+                        default=config.env_int("PIPELINE_WORKERS", 2),
+                        help="Parallel workers for download/extract/upload (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Read and extract only; no Cloudflare upload and no database write")
     parser.add_argument("--target-table", default=os.environ.get("TARGET_TABLE", "profiles"),
@@ -66,7 +70,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _preparsed_env_file(argv: list[str] | None) -> str:
+    """Find --env-file before the real parser runs, without consuming argv."""
+    finder = argparse.ArgumentParser(add_help=False)
+    finder.add_argument("--env-file", default=config.DEFAULT_ENV_FILE)
+    known, _rest = finder.parse_known_args(argv)
+    return known.env_file
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Load the env file before the parser is built: several defaults
+    # (--workers, --target-table, the OneDrive credentials) read the environment.
+    config.load_env(_preparsed_env_file(argv))
     args = build_parser().parse_args(argv)
     if args.workers < 1:
         raise SystemExit("ERROR: --workers must be 1 or greater.")

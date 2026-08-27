@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from time import monotonic
@@ -21,6 +22,29 @@ _FILE_NAME_NOISE = {
     "profile", "resume", "cv", "curriculum", "vitae", "copy", "final", "updated",
     "new", "doc", "docx", "pdf", "indeed", "linkedin", "signed", "draft",
 }
+
+
+# With two workers the per-record progress lines from both interleave, which
+# makes a run log unreadable. Each record collects its own lines and they are
+# printed as one block when that record finishes.
+_print_lock = threading.Lock()
+
+
+class Reporter:
+    """Per-record output buffer, flushed as one block under a shared lock."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def say(self, message: str) -> None:
+        self.lines.append(message)
+
+    def flush(self, header: str) -> None:
+        with _print_lock:
+            print(header)
+            for line in self.lines:
+                print(line)
+        self.lines.clear()
 
 
 def _name_from_file_name(file_name: str | None) -> tuple[str, str] | None:
@@ -54,7 +78,7 @@ def validate_fields(fields: dict) -> tuple[bool, list[str]]:
     return not problems, problems
 
 
-def _extract_fields(text: str, *, use_llm: bool) -> tuple[dict, str, str | None]:
+def _extract_fields(text: str, *, use_llm: bool, say=print) -> tuple[dict, str, str | None]:
     """Return (fields, extraction_mode, llm_error)."""
     raw: dict = {}
     mode = "regex"
@@ -64,10 +88,17 @@ def _extract_fields(text: str, *, use_llm: bool) -> tuple[dict, str, str | None]
         try:
             raw = llm_extract.extract_profile(text)
             mode = f"qwen:{llm_extract.model_name()}"
+            # A pass that failed on its own is not a failed extraction: the
+            # other passes still ran and the regex fallback covers the gap.
+            partial = raw.get("_pass_errors") or []
+            if partial:
+                llm_error = "; ".join(partial)
+                mode += "+partial"
+                say(f"  note: {len(partial)} extraction pass(es) fell back to regex: {llm_error}")
         except llm_extract.LlmError as exc:
             llm_error = str(exc)
             mode = "regex_fallback"
-            print(f"  warning: model extraction failed, falling back to regex: {exc}")
+            say(f"  warning: model extraction failed, falling back to regex: {exc}")
 
     fields = llm_extract.normalize_profile(raw, text)
     years, detail = experience.resolve_years_experience(
@@ -86,7 +117,9 @@ def process_one(
     graph_client,
     engine,
     args: argparse.Namespace,
+    reporter: "Reporter | None" = None,
 ) -> dict:
+    say = reporter.say if reporter is not None else print
     record = {
         "record_id": source.record_id,
         "source_file": source.source_file,
@@ -109,7 +142,7 @@ def process_one(
     ocr_error = None
     if pdf_text.looks_empty(text) and getattr(args, "ocr", True):
         # Image-only PDF: rasterise and OCR so the model still gets real text.
-        print(f"  no text layer; running OCR on {_label(source)} ({pages} page(s))...")
+        say(f"  no text layer; running OCR on {_label(source)} ({pages} page(s))...")
         try:
             text = pdf_text.ocr_text(
                 pdf_bytes,
@@ -117,16 +150,16 @@ def process_one(
                 max_pages=config.env_int("OCR_MAX_PAGES", 0) or None,
             )
             text_source = "ocr"
-            print(f"  OCR read {len(text)} character(s).")
+            say(f"  OCR read {len(text)} character(s).")
         except (pdf_text.TesseractError, pdf_text.PdfTextError) as exc:
             # OCR is a fallback, not a gate: carry on with whatever text exists.
             ocr_error = str(exc)
-            print(f"  warning: OCR failed: {exc}")
+            say(f"  warning: OCR failed: {exc}")
 
     record["text_source"] = text_source
     record["ocr_error"] = ocr_error
 
-    fields, mode, llm_error = _extract_fields(text, use_llm=args.use_llm)
+    fields, mode, llm_error = _extract_fields(text, use_llm=args.use_llm, say=say)
     experience_detail = fields.pop("_experience_detail", {})
 
     # Last resort so an unreadable scan still lands as a real row: the source
@@ -138,7 +171,7 @@ def process_one(
             fields["first_name"] = fields.get("first_name") or derived[0]
             fields["last_name"] = fields.get("last_name") or derived[1]
             fields["full_name"] = fields.get("full_name") or " ".join(derived)
-            print(f"  no name in the text; using the file name: {' '.join(derived)}")
+            say(f"  no name in the text; using the file name: {' '.join(derived)}")
 
     ok, problems = validate_fields(fields)
     record["validation"] = problems
@@ -166,6 +199,7 @@ def process_one(
         "zip_code": fields.get("zip_code"),
         "headline": fields.get("headline"),
         "specialty": fields.get("specialty"),
+        "current_employer": fields.get("current_employer"),
         "profession_type": fields.get("profession_type"),
         "work_authorization": fields.get("work_authorization"),
         "years_experience": fields.get("years_experience"),
@@ -186,7 +220,7 @@ def process_one(
     if args.dry_run:
         return {**record, "status": "would_process"}
 
-    print(f"  uploading original PDF to Cloudflare R2: {key}")
+    say(f"  uploading original PDF to Cloudflare R2: {key}")
     resume_url, uploaded_now = storage.upload_pdf(pdf_bytes, key)
     record.update({"resume_url": resume_url, "cloudflare_uploaded": uploaded_now})
 
@@ -219,6 +253,13 @@ def process_one(
         },
         "work_authorization": fields.get("work_authorization"),
         "extraction_notes": fields.get("_validation_notes") or [],
+        # What schema validation removed or shortened, so a NULL column can be
+        # traced back to "the resume did not support it" rather than a bug.
+        "schema_notes": fields.get("_schema_notes") or [],
+        "specialty_source": fields.get("_specialty_source"),
+        # The headline line reads "Specialty - Current organization"; this is
+        # the organization half. profiles has no column for it.
+        "current_employer": fields.get("current_employer"),
         "name_source": fields.get("_name_source") or "resume_text",
         "ocr_error": ocr_error,
         "llm_error": llm_error,
@@ -274,6 +315,8 @@ def run(args: argparse.Namespace) -> dict:
     env_file = config.load_env(args.env_file)
     print(f"Env file: {env_file}{'' if env_file.exists() else ' (not found; using process environment)'}")
 
+    # database.create_engine reads this to size the connection pool.
+    os.environ["PIPELINE_WORKERS"] = str(max(1, args.workers))
     args.use_llm = llm_extract.llm_enabled() and not args.no_llm
     config.validate_env(dry_run=args.dry_run, use_llm=args.use_llm)
 
@@ -326,6 +369,10 @@ def run(args: argparse.Namespace) -> dict:
     workers = max(1, min(args.workers, len(required) or 1))
     if required:
         print(f"Starting processing with {workers} worker(s)...")
+        if workers > 1:
+            print(f"  model calls are capped at "
+                  f"{config.env_int('LLM_MAX_CONCURRENCY', 1)} concurrent request(s); "
+                  "download, OCR and R2 upload run in parallel.")
 
     def _log(record: dict) -> None:
         if manifest_path is not None:
@@ -359,28 +406,50 @@ def run(args: argparse.Namespace) -> dict:
         _log(record)
         print(f"[{index}/{len(required)}] FAIL {_label(source)}: {exc}")
 
+    def _run_one(index: int, source: PdfSource):
+        """One record, with its progress lines buffered until it finishes."""
+        reporter = Reporter()
+        try:
+            record = process_one(
+                source=source, graph_client=graph_client, engine=engine,
+                args=args, reporter=reporter,
+            )
+        except Exception as exc:
+            reporter.flush(f"[{index}/{len(required)}] Reading {_label(source)}")
+            return exc
+        reporter.flush(f"[{index}/{len(required)}] Reading {_label(source)}")
+        return record
+
     if workers == 1:
         for index, source in enumerate(required, start=1):
-            print(f"[{index}/{len(required)}] Reading {_label(source)}")
-            try:
-                _on_success(index, source, process_one(
-                    source=source, graph_client=graph_client, engine=engine, args=args,
-                ))
-            except Exception as exc:
-                _on_failure(index, source, exc)
+            outcome = _run_one(index, source)
+            if isinstance(outcome, Exception):
+                _on_failure(index, source, outcome)
+            else:
+                _on_success(index, source, outcome)
     else:
-        futures = {}
+        # Threads, not processes: the work is I/O bound (Graph download, R2
+        # upload, the model call) and Tesseract releases the GIL in its own
+        # subprocess. Everything shared is either immutable (args, sources) or
+        # explicitly synchronised: the SQLAlchemy pool hands each thread its own
+        # connection, run_log writes under a lock, the boto3 client is built
+        # once under a lock, and model calls pass through a semaphore.
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pdf-worker") as executor:
-            for index, source in enumerate(required, start=1):
-                futures[executor.submit(
-                    process_one, source=source, graph_client=graph_client, engine=engine, args=args,
-                )] = (index, source)
+            futures = {
+                executor.submit(_run_one, index, source): (index, source)
+                for index, source in enumerate(required, start=1)
+            }
             for future in as_completed(futures):
                 index, source = futures[future]
                 try:
-                    _on_success(index, source, future.result())
-                except Exception as exc:
+                    outcome = future.result()
+                except Exception as exc:  # a crash inside _run_one itself
                     _on_failure(index, source, exc)
+                    continue
+                if isinstance(outcome, Exception):
+                    _on_failure(index, source, outcome)
+                else:
+                    _on_success(index, source, outcome)
 
     elapsed = max(monotonic() - started, 0.001)
     print(f"\nSummary: {stats}")

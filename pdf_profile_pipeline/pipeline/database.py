@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 
 from . import config
+from .schema import PROFILE_LIMITS, WORK_HISTORY_LIMITS, truncate
 
 PROFILE_NAMESPACE = uuid.UUID("6f9b1a6e-6f0e-5f6b-9a0e-2f1c3d4e5a6b")
 
@@ -42,7 +43,18 @@ def create_engine():
         raise SystemExit("ERROR: DATABASE_URL is missing.")
     if not db_url.startswith("postgresql"):
         raise SystemExit("ERROR: DATABASE_URL must point to Neon Postgres.")
-    return sqlalchemy.create_engine(db_url, future=True, pool_pre_ping=True)
+    # One pooled connection per worker, plus headroom. Each worker opens its own
+    # `engine.begin()` transaction, so a pool smaller than the worker count would
+    # serialise them behind a checkout wait instead of running concurrently.
+    workers = max(1, config.env_int("PIPELINE_WORKERS", 2))
+    return sqlalchemy.create_engine(
+        db_url,
+        future=True,
+        pool_pre_ping=True,
+        pool_size=workers + 1,
+        max_overflow=workers,
+        pool_recycle=300,
+    )
 
 
 def quoted_table(name: str) -> str:
@@ -166,15 +178,25 @@ def upsert_profile(
     table = quoted_table(table_name)
     now = utcnow()
     row_id = existing_id or profile_id
+    # Every varchar column is clamped here as well as in schema.validate_profile.
+    # An over-long headline used to abort the whole INSERT, which surfaced as
+    # "extraction failed" rather than as the one-column problem it was.
+    fields = {
+        key: (truncate(value, PROFILE_LIMITS[key]) if key in PROFILE_LIMITS and
+              isinstance(value, str) else value)
+        for key, value in fields.items()
+    }
     params = {
         "profile_id": row_id,
         "first_name": fields.get("first_name"),
         "last_name": fields.get("last_name"),
-        "headline": fields.get("headline") or fields.get("specialty"),
+        "headline": truncate(
+            fields.get("headline") or fields.get("specialty"), PROFILE_LIMITS["headline"]),
         "bio": fields.get("bio"),
         "specialty": fields.get("specialty"),
         "profession_type": fields.get("profession_type"),
-        "years_experience": int(fields.get("years_experience") or 0),
+        # smallint column: a nonsense value from a bad parse must not abort the row.
+        "years_experience": max(0, min(int(fields.get("years_experience") or 0), 99)),
         "email": fields.get("email"),
         "phone": fields.get("phone"),
         "city": fields.get("city"),
@@ -354,13 +376,16 @@ def sync_work_history(conn, *, profile_id: str, positions: list[dict]) -> int:
         """), {
             "work_id": work_id,
             "profile_id": profile_id,
-            "employer_name": employer[:255],
-            "job_title": title[:255],
-            "specialty": (position.get("specialty") or None),
+            # These columns are varchar(200)/(120)/(100)/(2) - not 255.
+            "employer_name": truncate(employer, WORK_HISTORY_LIMITS["employer"]),
+            "job_title": truncate(title, WORK_HISTORY_LIMITS["title"]),
+            "specialty": truncate(
+                position.get("specialty") or None, WORK_HISTORY_LIMITS["specialty"]),
             "start_date": parse_month_year(position.get("start_date")),
             "end_date": parse_month_year(position.get("end_date")),
-            "city": (position.get("city") or None),
-            "state_code": (position.get("state_code") or None),
+            "city": truncate(position.get("city") or None, WORK_HISTORY_LIMITS["city"]),
+            "state_code": truncate(
+                position.get("state_code") or None, WORK_HISTORY_LIMITS["state_code"]),
             "description": (position.get("description") or None),
             "created_at": now,
         })

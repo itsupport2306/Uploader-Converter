@@ -35,6 +35,13 @@ DEFAULT_ENV_VALUES = {
     "LLM_MAX_INPUT_CHARS": "18000",
     "LLM_MAX_TOKENS": "4096",
     "LLM_TEMPERATURE": "0",
+    # Extraction runs as three focused passes; these size the slice each sees.
+    "LLM_HEADER_CHARS": "2500",
+    "LLM_CHUNK_CHARS": "5000",
+    # llama.cpp serves one request per slot, so model calls stay serialised even
+    # when two PDF workers are running.
+    "LLM_MAX_CONCURRENCY": "1",
+    "PIPELINE_WORKERS": "2",
     "R2_KEY_PREFIX": "resumes",
     "TARGET_TABLE": "profiles",
     "ONEDRIVE_TENANT": "common",

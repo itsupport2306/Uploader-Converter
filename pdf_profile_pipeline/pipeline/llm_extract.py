@@ -4,6 +4,13 @@ The model is reached over an OpenAI-compatible /chat/completions endpoint
 (Ollama, vLLM, LM Studio, or a hosted gateway). Base URL, API key, and model
 name all come from the environment -- nothing is hardcoded.
 
+Extraction runs as three small passes -- header, work history, list sections --
+rather than one request for the whole profile. A 1.5B model given the entire
+schema at once drops fields and runs out of output tokens mid-array; given one
+short schema and one slice of the resume it stays complete. Where the server
+supports it, a JSON schema is compiled into a sampling grammar so the reply is
+valid JSON by construction.
+
 If the model is unavailable or returns unusable output, a regex fallback fills
 in what it can so a run never dies on one bad PDF.
 """
@@ -12,12 +19,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from . import config
+from . import schema as field_schema
 
 FIELDS = (
     "first_name", "last_name", "full_name", "email", "phone",
@@ -28,79 +37,164 @@ FIELDS = (
 # List-valued fields that end up in resume_sections / education.
 LIST_FIELDS = ("certifications", "skills", "languages", "education", "positions")
 
+# ---------------------------------------------------------------------------
+# Prompts
+#
+# The model on the other end is Qwen2.5-1.5B-Instruct. A 1.5B model asked for
+# the entire profile -- header, ten jobs with duties, skills, certifications --
+# in one JSON object reliably drifts: it drops "specialty", truncates the
+# headline, and runs out of output tokens mid-array, which is where the invalid
+# JSON came from. So the work is split into three small passes, each with a
+# short schema and a short slice of the resume. Every pass is independently
+# recoverable: a failure costs that section, not the whole profile.
+
 SYSTEM_PROMPT = (
-    "You are a resume parser. You extract structured candidate data from the "
-    "text of one resume, which may have come from OCR and may contain noise.\n"
+    "You are a precise resume parser. You read the text of one resume, which "
+    "may come from OCR and may contain noise, and return structured data.\n"
     "Absolute rules:\n"
-    "1. Reply with a single JSON object and nothing else - no prose, no code fence.\n"
-    "2. Copy values from the resume. Never invent, guess, infer, or complete a "
-    "value that is not written in the text.\n"
-    "3. Use null for a missing string or number, and [] for a missing list. "
-    "Never use placeholders such as \"N/A\", \"unknown\", \"Not specified\", or \"\".\n"
-    "4. Include every job in \"positions\" - do not stop early and do not summarise.\n"
-    "5. Drop OCR garbage: stray single letters, icon leftovers, the U+FFFD "
-    "character, and lines of unrelated capitals. Remove exact duplicates from lists."
+    "1. Output ONE JSON object and nothing else. No prose, no explanation, no "
+    "code fence, no trailing text after the closing brace.\n"
+    "2. Copy values from the resume text. Never invent, guess, infer or "
+    "complete a value that is not written in the text.\n"
+    "3. Use null for a missing string or number and [] for a missing list. "
+    "Never write \"N/A\", \"unknown\", \"Not specified\", \"none\" or \"\".\n"
+    "4. Never abbreviate or shorten a value. Copy it in full.\n"
+    "5. Ignore OCR debris: stray single letters, the U+FFFD character, and "
+    "short runs of unrelated capitals."
 )
 
-USER_PROMPT_TEMPLATE = """Extract this candidate's profile from the resume text below.
+# --- pass 1: the header block -------------------------------------------------
+#
+# An Indeed/job-board profile PDF always opens the same way:
+#     Donna Omara
+#     Infant room teacher - Creme de la Creme     <- the headline
+#     Mount Pleasant, SC                          <- the candidate's location
+#     Professional summary
+#     ...
+# Feeding only that block keeps the pass short and stops the model from
+# picking a city or title out of a job listed further down the page.
 
-Return exactly this JSON shape and these keys:
+CORE_PROMPT_TEMPLATE = """Read the top of this resume and return the candidate's identity.
+
+Return exactly these keys:
 {{
-  "first_name": string|null,
-  "last_name": string|null,
-  "full_name": string|null,
+  "full_name": string|null,          // the candidate's own name, no credentials
   "email": string|null,
   "phone": string|null,
-  "city": string|null,                // the candidate's own city, not an employer's
-  "state_code": string|null,          // 2-letter US state code, uppercase
+  "city": string|null,               // the CANDIDATE's city, from the header
+  "state_code": string|null,         // 2-letter US state code, uppercase
   "zip_code": string|null,
-  "headline": string|null,            // current or most recent job title, verbatim
-  "specialty": string|null,           // primary clinical/professional specialty or field
-  "profession_type": string|null,     // e.g. "Nurse", "Physician", "Teacher", "Driver"
-  "work_authorization": string|null,  // only if the resume states it
-  "total_years_experience": number|null,  // TOTAL career experience, not one job
-  "bio": string|null,                 // the resume's own summary, or 2-4 factual sentences drawn only from it
-  "positions": [                      // EVERY job entry, newest first, no duplicates
+  "headline": string|null,
+  "specialty": string|null,
+  "current_employer": string|null,
+  "profession_type": string|null,
+  "work_authorization": string|null,
+  "bio": string|null,
+  "total_years_experience": number|null
+}}
+
+headline: the professional title line that sits directly under the name. Copy
+the WHOLE line including the employer if it is written as "Title - Employer".
+Do not shorten it and do not stop at the dash.
+
+specialty: the candidate's own job title, copied from that same headline line.
+The line is written "Specialty - Current organization", so the specialty is the
+part BEFORE the dash and the organization is the part after it:
+  "Infant room teacher - Creme de la Creme"
+  -> specialty "Infant room teacher", current_employer "Creme de la Creme"
+Copy the specialty exactly as written. Do NOT replace it with a broader
+category such as "Childcare", "Education" or "Nursing", and do not include the
+employer in it. If the resume states a specialty explicitly somewhere else
+("Specialty: Pediatrics"), prefer that wording instead.
+
+current_employer: the organization on that headline line, after the dash.
+
+profession_type: the occupation itself, one or two words -- "Teacher", "Nurse",
+"Driver", "Caregiver", "Manager".
+
+city / state_code: the candidate's own location from the header block, not an
+employer's address. "Mount Pleasant, SC" -> city "Mount Pleasant",
+state_code "SC".
+
+bio: the professional summary / about / additional information text, copied
+verbatim. If the resume has no such paragraph, use null -- do not write one.
+A work-authorization sentence on its own is not a bio; put it in
+work_authorization instead.
+
+total_years_experience: only a total career length that the resume states or
+that its earliest job start clearly implies. Never one job's length.
+
+RESUME HEADER:
+---
+{text}
+---
+JSON:"""
+
+# --- pass 2: the experience section ------------------------------------------
+#
+# Positions are the field that used to get cut off, because they are the bulk
+# of the output. They now get their own call (or several, for a long history),
+# with nothing else competing for the token budget.
+
+POSITIONS_PROMPT_TEMPLATE = """List EVERY job in this section of a resume's work history.
+
+Return exactly this shape:
+{{
+  "positions": [
     {{
       "title": string|null,
       "employer": string|null,
       "city": string|null,
       "state_code": string|null,
-      "start_date": string|null,      // "YYYY-MM" or "YYYY" exactly as datable from the text
-      "end_date": string|null,        // same format, or "Present" if current
-      "description": string|null      // the duties text for this job, cleaned up
+      "start_date": string|null,
+      "end_date": string|null,
+      "description": string|null
     }}
-  ],
-  "certifications": [string],         // licences and certifications, deduplicated
-  "education": [
-    {{"degree": string|null, "field": string|null, "school": string|null, "year": string|null}}
-  ],
-  "skills": [string],                 // individual skills, deduplicated, no sentences
-  "languages": [string]
+  ]
 }}
 
-Rules for total_years_experience:
-- Prefer a stated total/overall career length (for example "12+ years of nursing experience").
-- If only individual jobs are listed, use the span from the earliest start to the
-  latest end without double-counting overlapping dates.
-- Never report a single job's duration as the total when the resume shows a longer career.
-- Use a plain number of years. Use null if the resume gives no basis for it.
+Rules:
+- One entry per job heading. A heading is written "Title - Employer".
+- Include short entries that have only a heading and no dates or duties.
+- Copy the dates as written ("August 2025", "2013"). Use "Present" for a
+  current job. Never calculate or invent a date. A span such as "11 mo" or
+  "3 yr 2 mo" is a duration, not a date -- ignore it.
+- description: the duty text under that heading, copied and tidied. null if the
+  heading has none.
+- Do not merge two jobs and do not repeat one.
+- Return the jobs in the order they appear.
 
-Rules for positions:
-- One entry per job heading. A heading usually looks like "Title - Employer".
-- Keep the dates as written; do not calculate, shift, or fill in a missing date.
-- If the same job appears twice, keep it once.
-
-Rules for lists:
-- certifications, skills and languages hold short items, each written once.
-- A skill is a short phrase, not a sentence and not a duty description.
-- If a section is absent from the resume, return [] for it.
-
-RESUME TEXT:
+WORK HISTORY:
 ---
 {text}
 ---
 JSON:"""
+
+# --- pass 3: the list sections ------------------------------------------------
+
+LISTS_PROMPT_TEMPLATE = """Extract the list sections of this resume.
+
+Return exactly this shape:
+{{
+  "certifications": [string],
+  "skills": [string],
+  "languages": [string],
+  "education": [
+    {{"degree": string|null, "field": string|null, "school": string|null, "year": string|null}}
+  ]
+}}
+
+Rules:
+- Each item is a short phrase written once. Never a sentence, never a duty.
+- Deduplicate: the same certification listed twice appears once.
+- Use [] for a section the text does not contain.
+
+SECTIONS:
+---
+{text}
+---
+JSON:"""
+
 
 US_STATES = {
     "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
@@ -129,7 +223,6 @@ def llm_enabled() -> bool:
 def model_name() -> str:
     return os.environ.get("LLM_MODEL", "")
 
-
 def _endpoint() -> str:
     base = (os.environ.get("LLM_BASE_URL") or "").strip().rstrip("/")
     if not base:
@@ -139,36 +232,172 @@ def _endpoint() -> str:
     return urljoin(base + "/", "chat/completions")
 
 
-def _call_model(messages: list[dict], *, timeout: int, temperature: float) -> str:
-    payload = {
-        "model": model_name(),
-        "messages": messages,
-        "temperature": temperature,
-        "stream": False,
-        # Too low and the JSON reply is cut off mid-object, which costs the
-        # whole extraction and silently drops the run to regex fallback.
-        "max_tokens": config.env_int("LLM_MAX_TOKENS", 1024),
-        # Honoured by Ollama/vLLM; harmlessly ignored elsewhere.
-        "response_format": {"type": "json_object"},
-    }
+# llama.cpp serves one request per slot. Two PDF workers firing at the same
+# server would queue inside it anyway, and on a single-slot build the second
+# request is rejected outright, so the calls are serialised here instead.
+# Built lazily: the env file is loaded after this module is imported.
+_llm_gate = None
+_gate_lock = threading.Lock()
+
+
+def llm_gate() -> threading.BoundedSemaphore:
+    global _llm_gate
+    with _gate_lock:
+        if _llm_gate is None:
+            _llm_gate = threading.BoundedSemaphore(
+                max(1, config.env_int("LLM_MAX_CONCURRENCY", 1)))
+        return _llm_gate
+
+# Set once, the first time the server refuses a json_schema response_format, so
+# the remaining calls in the run do not each pay for the same rejected attempt.
+_schema_unsupported = False
+_schema_lock = threading.Lock()
+
+
+# --- JSON schemas ------------------------------------------------------------
+#
+# llama.cpp compiles a json_schema response_format into a GBNF grammar and
+# constrains sampling with it, which is what makes "valid JSON every time" a
+# property of the decoder rather than a hope about the prompt. Servers that do
+# not support it fall back to json_object, and then to the repair path below.
+
+_NULLABLE_STRING = {"type": ["string", "null"]}
+
+CORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "full_name": _NULLABLE_STRING,
+        "email": _NULLABLE_STRING,
+        "phone": _NULLABLE_STRING,
+        "city": _NULLABLE_STRING,
+        "state_code": _NULLABLE_STRING,
+        "zip_code": _NULLABLE_STRING,
+        "headline": _NULLABLE_STRING,
+        "specialty": _NULLABLE_STRING,
+        "current_employer": _NULLABLE_STRING,
+        "profession_type": _NULLABLE_STRING,
+        "work_authorization": _NULLABLE_STRING,
+        "bio": _NULLABLE_STRING,
+        "total_years_experience": {"type": ["number", "null"]},
+    },
+    "required": [
+        "full_name", "city", "state_code", "headline", "specialty",
+        "profession_type", "bio",
+    ],
+    "additionalProperties": False,
+}
+
+POSITIONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "positions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": _NULLABLE_STRING,
+                    "employer": _NULLABLE_STRING,
+                    "city": _NULLABLE_STRING,
+                    "state_code": _NULLABLE_STRING,
+                    "start_date": _NULLABLE_STRING,
+                    "end_date": _NULLABLE_STRING,
+                    "description": _NULLABLE_STRING,
+                },
+                "required": ["title", "employer"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["positions"],
+    "additionalProperties": False,
+}
+
+LISTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "certifications": {"type": "array", "items": {"type": "string"}},
+        "skills": {"type": "array", "items": {"type": "string"}},
+        "languages": {"type": "array", "items": {"type": "string"}},
+        "education": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "degree": _NULLABLE_STRING,
+                    "field": _NULLABLE_STRING,
+                    "school": _NULLABLE_STRING,
+                    "year": _NULLABLE_STRING,
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["certifications", "skills", "languages", "education"],
+    "additionalProperties": False,
+}
+
+
+def _post(payload: dict, *, timeout: int) -> dict:
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     api_key = os.environ.get("LLM_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    request = Request(_endpoint(), data=data, headers=headers, method="POST")
+    with urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+
+
+def _call_model(
+    messages: list[dict],
+    *,
+    timeout: int,
+    temperature: float,
+    max_tokens: int,
+    schema: dict | None = None,
+) -> str:
+    """One chat completion. Returns the assistant's raw content string."""
+    global _schema_unsupported
+
+    def build(use_schema: bool) -> dict:
+        payload = {
+            "model": model_name(),
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+            "max_tokens": max_tokens,
+        }
+        if use_schema and schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "profile", "strict": True, "schema": schema},
+            }
+        else:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    with _schema_lock:
+        use_schema = schema is not None and not _schema_unsupported
 
     last_error: Exception | None = None
     for attempt in range(1, 4):
-        req = Request(_endpoint(), data=data, headers=headers, method="POST")
         try:
-            with urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+            body = _post(build(use_schema), timeout=timeout)
             choices = body.get("choices") or []
             if not choices:
                 raise LlmError(f"Model returned no choices: {str(body)[:200]}")
             return (choices[0].get("message") or {}).get("content") or ""
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
+            # A server that does not understand json_schema rejects the request
+            # outright. Drop to json_object for this call and the rest of the run
+            # rather than reporting the whole extraction as failed.
+            if use_schema and exc.code in {400, 404, 422, 500}:
+                with _schema_lock:
+                    _schema_unsupported = True
+                use_schema = False
+                last_error = LlmError(f"HTTP {exc.code}: {detail}")
+                continue
             last_error = LlmError(f"HTTP {exc.code} from model endpoint: {detail}")
             if exc.code not in {408, 429, 500, 502, 503, 504} or attempt == 3:
                 raise last_error from exc
@@ -181,13 +410,40 @@ def _call_model(messages: list[dict], *, timeout: int, temperature: float) -> st
     raise last_error or LlmError("Model call failed.")
 
 
+# ---------------------------------------------------------------------------
+# JSON recovery
+#
+# With a grammar-constrained server none of this fires. It exists for the
+# servers and builds that ignore response_format, where a small model produces
+# JSON with a code fence around it, a trailing comma, a // comment, Python
+# literals, or an object that simply ran out of output tokens.
+
+_FENCE = re.compile(r"```(?:json|JSON)?\s*(.+?)(?:```|$)", re.DOTALL)
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+_LINE_COMMENT = re.compile(r"(?<![:\"'\\])//[^\n\"]*$", re.MULTILINE)
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_PY_LITERAL = re.compile(r"(?<![\w\"'])(True|False|None)(?![\w\"'])")
+_PY_LITERALS = {"True": "true", "False": "false", "None": "null"}
+
+
+def _tidy_json_text(text: str) -> str:
+    """Fix the syntax errors a small model actually makes, and nothing else."""
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    text = _BLOCK_COMMENT.sub("", text)
+    text = _LINE_COMMENT.sub("", text)
+    text = _PY_LITERAL.sub(lambda m: _PY_LITERALS[m.group(1)], text)
+    text = _TRAILING_COMMA.sub(r"\1", text)
+    return text.strip()
+
+
 def _repair_truncated_json(fragment: str) -> dict | None:
     """Recover a reply that ran out of output tokens mid-object.
 
     A resume with a dozen jobs produces a long object, and losing the whole
     extraction over the last few characters would drop us to regex for a reply
-    that was 95% complete. Trailing partial values are discarded, then the open
-    brackets are closed.
+    that was 95% complete. The trailing partial value is discarded, then the
+    open brackets are closed.
     """
     # Walk the text tracking string state, and remember the last position where
     # the structure was safe to cut: just after a completed element.
@@ -213,7 +469,7 @@ def _repair_truncated_json(fragment: str) -> dict | None:
             if depth:
                 depth.pop()
             cut = index + 1
-        elif char in ",":
+        elif char == ",":
             cut = index  # drop the dangling comma with the partial element
         elif char.isdigit() or char in "eE.+-" or char.isalpha():
             cut = index + 1
@@ -242,6 +498,8 @@ def _repair_truncated_json(fragment: str) -> dict | None:
             depth.pop()
     if in_string:
         candidate += '"'
+    # A cut that landed on a key with no value would close as {"key"} - drop it.
+    candidate = re.sub(r",?\s*\"[^\"]*\"\s*:\s*$", "", candidate)
     candidate += "".join(reversed(depth))
 
     try:
@@ -252,45 +510,253 @@ def _repair_truncated_json(fragment: str) -> dict | None:
 
 
 def _parse_json_object(raw: str) -> dict:
+    """Turn a model reply into a dict, repairing what can be repaired."""
     text = (raw or "").strip()
-    fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
+    fenced = _FENCE.search(text)
     if fenced:
         text = fenced.group(1).strip()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
+
+    for candidate in _json_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            parsed = _repair_truncated_json(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    raise LlmError(f"Model returned unusable JSON: {text[:200]}")
+
+
+def _json_candidates(text: str):
+    """Progressively more aggressive readings of the reply."""
+    yield text
+    tidied = _tidy_json_text(text)
+    if tidied != text:
+        yield tidied
+    for source in (tidied, text):
+        start, end = source.find("{"), source.rfind("}")
         if start != -1 and end > start:
+            yield source[start:end + 1]
+        if start != -1:
+            # No usable closing brace: the reply hit the token limit.
+            yield source[start:]
+
+
+# Appended to the second attempt when the first reply could not be parsed.
+NUDGE = (
+    "\n\nReply with ONLY the JSON object. Start your reply with { and end it "
+    "with }. Do not write anything before or after it."
+)
+
+
+def _ask_json(
+    prompt: str,
+    schema: dict,
+    *,
+    max_tokens: int,
+    label: str,
+) -> dict:
+    """One extraction pass. Retries once with a blunter instruction, then gives up.
+
+    Raising is per-pass, so a failed positions pass still leaves a good header
+    pass in place instead of dropping the whole profile to regex.
+    """
+    timeout = config.env_int("LLM_TIMEOUT_SECONDS", 180)
+    temperature = config.env_float("LLM_TEMPERATURE", 0.0)
+    attempts = [
+        [{"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content": prompt}],
+        [{"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content":
+          prompt + NUDGE}],
+    ]
+    last_error: Exception | None = None
+    for messages in attempts:
+        with llm_gate():
             try:
-                parsed = json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                parsed = _repair_truncated_json(text[start:])
-        elif start != -1:
-            # No closing brace at all: the reply hit the token limit.
-            parsed = _repair_truncated_json(text[start:])
-        else:
-            raise LlmError(f"Model did not return JSON: {text[:200]}")
-        if parsed is None:
-            raise LlmError(f"Model returned invalid JSON: {text[:200]}")
-    if not isinstance(parsed, dict):
-        raise LlmError("Model returned JSON that was not an object.")
-    return parsed
+                content = _call_model(
+                    messages,
+                    timeout=timeout,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    schema=schema,
+                )
+            except LlmError:
+                # A transport failure will not be fixed by rewording the prompt.
+                raise
+        try:
+            return _parse_json_object(content)
+        except LlmError as exc:
+            last_error = exc
+    raise LlmError(f"{label}: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# Slicing the resume for each pass
+#
+# Each pass sees only the part of the resume it needs. That is what keeps a
+# 1.5B model's output short enough to stay complete and well-formed, and it
+# stops the header pass from picking a city out of a job halfway down the page.
+
+_EXPERIENCE_HEADINGS = (
+    "experience", "work experience", "professional experience",
+    "employment history", "work history", "employment",
+)
+_LIST_HEADINGS = (
+    "certifications & licenses", "certifications and licenses", "certifications",
+    "licenses & certifications", "licenses and certifications", "licenses",
+    "licensure", "credentials", "skills", "technical skills", "core competencies",
+    "competencies", "languages", "language proficiency", "education",
+    "education & training", "academic background",
+)
+
+
+def _heading_index(lines: list[str], headings) -> int | None:
+    for index, line in enumerate(lines):
+        if line.lower().strip(": ") in headings:
+            return index
+    return None
+
+
+def split_sections(text: str) -> dict:
+    """Cut the resume into the header, the experience block and the list blocks.
+
+    Falls back to a character split when a resume has no recognisable headings,
+    so a badly OCR'd page still produces three non-empty slices.
+    """
+    lines = (text or "").split("\n")
+    experience_at = _heading_index(lines, _EXPERIENCE_HEADINGS)
+    lists_at = None
+    for index, line in enumerate(lines):
+        if line.lower().strip(": ") in _LIST_HEADINGS and (
+            experience_at is None or index > experience_at
+        ):
+            lists_at = index
+            break
+
+    if experience_at is None:
+        head_end = min(len(lines), 40)
+        return {
+            "header": "\n".join(lines[:head_end]),
+            "experience": "\n".join(lines[head_end:]),
+            "lists": "\n".join(lines[head_end:]),
+        }
+
+    header = "\n".join(lines[:experience_at])
+    experience_end = lists_at if lists_at is not None else len(lines)
+    return {
+        "header": header,
+        "experience": "\n".join(lines[experience_at + 1:experience_end]),
+        "lists": "\n".join(lines[experience_end:]) if lists_at is not None else "",
+    }
+
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit].rsplit("\n", 1)[0] + "\n[...truncated...]"
+
+
+def _chunk_experience(text: str, limit: int) -> list[str]:
+    """Split a long work history on job-heading boundaries, never mid-job."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for block in re.split(r"\n\s*\n", text):
+        block_size = len(block) + 2
+        if current and size + block_size > limit:
+            chunks.append("\n\n".join(current))
+            current, size = [], 0
+        current.append(block)
+        size += block_size
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
 
 
 def extract_profile(text: str) -> dict:
-    """Ask Qwen2.5 for the structured profile. Raises LlmError on failure."""
-    max_chars = config.env_int("LLM_MAX_INPUT_CHARS", 18000)
+    """Ask the model for the structured profile in three focused passes.
+
+    Returns the merged raw dict. Raises LlmError only when nothing at all could
+    be extracted; a single failed pass is reported through "_pass_errors" so the
+    regex fallback can fill that section and the rest is still used.
+    """
     cleaned = scrub_ocr_noise(text)
-    trimmed = cleaned if len(cleaned) <= max_chars else cleaned[:max_chars] + "\n[...truncated...]"
-    content = _call_model(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=trimmed)},
-        ],
-        timeout=config.env_int("LLM_TIMEOUT_SECONDS", 180),
-        temperature=config.env_float("LLM_TEMPERATURE", 0.0),
-    )
-    return _parse_json_object(content)
+    sections = split_sections(cleaned)
+    header_chars = config.env_int("LLM_HEADER_CHARS", 2500)
+    chunk_chars = config.env_int("LLM_CHUNK_CHARS", 5000)
+    max_tokens = config.env_int("LLM_MAX_TOKENS", 4096)
+
+    raw: dict = {}
+    errors: list[str] = []
+
+    # Pass 1 -- header. The bio may live under "Additional information" at the
+    # very bottom, so the tail is appended when the header block has no summary.
+    header = _clip(sections["header"], header_chars)
+    extra = _extra_information(cleaned)
+    if extra:
+        header = f"{header}\n\nAdditional information\n{_clip(extra, 1500)}"
+    try:
+        raw.update(_ask_json(
+            CORE_PROMPT_TEMPLATE.format(text=header),
+            CORE_SCHEMA, max_tokens=min(max_tokens, 900), label="header pass",
+        ))
+    except LlmError as exc:
+        errors.append(str(exc))
+
+    # Pass 2 -- work history, chunked so a long list never hits the token cap.
+    positions: list[dict] = []
+    for chunk in _chunk_experience(sections["experience"], chunk_chars):
+        try:
+            reply = _ask_json(
+                POSITIONS_PROMPT_TEMPLATE.format(text=chunk),
+                POSITIONS_SCHEMA, max_tokens=max_tokens, label="positions pass",
+            )
+        except LlmError as exc:
+            errors.append(str(exc))
+            continue
+        positions.extend(field_schema.coerce_positions(reply.get("positions")))
+    if positions:
+        raw["positions"] = positions
+
+    # Pass 3 -- the list sections. Optional: the regex pass handles these well,
+    # so a failure here is recorded and otherwise ignored.
+    lists_text = sections["lists"] or sections["experience"]
+    if lists_text.strip():
+        try:
+            raw.update(_ask_json(
+                LISTS_PROMPT_TEMPLATE.format(text=_clip(lists_text, chunk_chars)),
+                LISTS_SCHEMA, max_tokens=max_tokens, label="lists pass",
+            ))
+        except LlmError as exc:
+            errors.append(str(exc))
+
+    if not raw:
+        raise LlmError("; ".join(errors) or "the model returned nothing usable")
+    if errors:
+        raw["_pass_errors"] = errors
+    return raw
+
+
+_EXTRA_HEADINGS = ("additional information", "about", "about me", "professional summary",
+                   "summary", "profile", "objective")
+
+
+def _extra_information(text: str) -> str:
+    """The free-text paragraph a job-board profile puts at the very bottom.
+
+    On an Indeed profile the "Professional summary" heading is often empty and
+    the candidate's own words sit under "Additional information" instead, so the
+    header pass is shown both.
+    """
+    lines = [line.strip() for line in (text or "").split("\n")]
+    for index, line in enumerate(lines):
+        if line.lower().strip(": ") == "additional information":
+            return "\n".join(lines[index + 1:]).strip()
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -443,49 +909,153 @@ def regex_profile(text: str) -> dict:
             name_line_index = index
             break
 
-    for index, line in enumerate(lines):
-        if index == name_line_index:
-            continue
-        match = _CITY_STATE.search(line)
-        if not match:
-            continue
-        city, state = match.group(1).strip(), match.group(2)
-        if state not in STATE_CODES:
-            continue
-        # "Gonzalez, RN, BSN" is a credential list, not a city and state.
-        if state in CREDENTIALS and any(
-            token.strip(".,").upper() in CREDENTIALS for token in line.split(",")[2:3] + line.split()[-2:]
-        ):
-            continue
-        if len(city.split()) > 3:
-            continue
-        profile["city"] = _title_case(city)
-        profile["state_code"] = state
-        break
+    # The headline is the title line directly under the name. On a job-board
+    # profile it reads "Infant room teacher - Creme de la Creme", and the whole
+    # line is the headline -- taking only the part before the dash was what
+    # truncated it.
+    if name_line_index is not None:
+        profile["headline"] = _headline_after_name(lines, name_line_index)
 
-    specialty = re.search(
+    # The candidate's own location sits in the header block. Searching the whole
+    # document instead would find the first employer's address.
+    header_end = _experience_line_index(lines)
+    profile.update(_regex_location(lines, name_line_index, header_end))
+
+    # A resume that names its specialty outright is the most reliable source.
+    stated = re.search(
         r"(?:specialty|specialt(?:y|ies)|department|practice area)\s*[:\-]\s*([^\n]{2,60})",
         text or "", re.IGNORECASE,
     )
-    if specialty:
-        profile["specialty"] = _clean(specialty.group(1))
+    if stated:
+        profile["specialty"] = _clean(stated.group(1))
+    else:
+        # Otherwise it is the headline line, which reads
+        # "Specialty - Current organization".
+        title, employer = split_headline(profile.get("headline"))
+        profile["specialty"] = title
+        profile["current_employer"] = employer
 
-    # The summary section only. The first long paragraph of a resume is usually
-    # the newest job's duties, which is not a bio.
-    summary = " ".join(_section_lines(text, (
-        "professional summary", "summary", "profile", "objective", "about",
-        "career summary", "overview",
-    )))
-    summary = _clean(summary)
-    if summary and len(summary) > 20:
-        profile["bio"] = summary[:1200]
+    profile["bio"] = _regex_bio(text)
 
     profile.update(_regex_contact(text))
     profile.update(_regex_sections(text))
     profile["positions"] = _regex_positions(text)
-    if profile.get("positions"):
-        profile["headline"] = profile["positions"][0].get("title")
+    if not profile.get("headline") and profile.get("positions"):
+        profile["headline"] = _position_headline(profile["positions"][0])
     return profile
+
+
+# A summary section that only states work authorisation is not a bio; the
+# candidate's own words are then under "Additional information" instead.
+_SUMMARY_HEADINGS = (
+    "professional summary", "summary", "profile", "objective", "about",
+    "about me", "career summary", "overview",
+)
+
+
+def _regex_bio(text: str) -> str | None:
+    """The candidate's own summary paragraph, wherever the profile put it."""
+    for headings in (_SUMMARY_HEADINGS, ("additional information",)):
+        summary = _clean(" ".join(_section_lines(text, headings)))
+        if not summary or len(summary) <= 20:
+            continue
+        # "Authorized to work in the US for any employer" is a status line that
+        # a job board prints under the summary heading, not a summary.
+        if _WORK_AUTH.match(summary) and len(summary) < 120:
+            continue
+        return summary[:4000]
+    return None
+
+
+# The headline line of a job-board profile is "Specialty - Current organization".
+# Only a spaced dash separates them: a hyphenated job title ("Full-time nanny")
+# and an employer that contains one ("Creme de la Creme - Mt Pleasant") both
+# survive, because neither has spaces around the hyphen.
+_HEADLINE_SPLIT = re.compile(r"\s+[-–—]\s+")
+# "2 yrs", "11 mo", "3 yr 2 mo", "Present" -- a tenure, not an organization.
+_DURATION_ONLY = re.compile(
+    r"(?:\d+\s*(?:\+)?\s*(?:yr|yrs|year|years|mo|mos|month|months)\s*)+|present|current",
+    re.IGNORECASE,
+)
+
+
+def split_headline(headline: str | None) -> tuple[str | None, str | None]:
+    """'Infant room teacher - Creme de la Creme' -> ('Infant room teacher', ...).
+
+    Returns (specialty, current_employer). A headline with no dash is all
+    specialty and names no employer.
+    """
+    text = _clean(headline)
+    if not text:
+        return None, None
+    parts = _HEADLINE_SPLIT.split(text, maxsplit=1)
+    if len(parts) == 1:
+        return _clean(parts[0]), None
+    specialty, employer = _clean(parts[0]), _clean(parts[1])
+    # Some profiles put a tenure after the dash instead of an employer
+    # ("Home Health CNA - 2 yrs"). That is not an organization.
+    if employer and _DURATION_ONLY.fullmatch(employer):
+        return specialty, None
+    return specialty, employer
+
+
+def _position_headline(position: dict) -> str | None:
+    """Rebuild "Title - Employer" from a parsed position."""
+    title, employer = position.get("title"), position.get("employer")
+    if title and employer:
+        return f"{title} - {employer}"
+    return title or employer
+
+
+def _experience_line_index(lines: list[str]) -> int:
+    """Where the header block ends and the work history begins."""
+    for index, line in enumerate(lines):
+        if line.lower().strip(": ") in _EXPERIENCE_HEADINGS:
+            return index
+    return min(len(lines), 15)
+
+
+# A headline line is a title, not a heading, a contact detail or a location.
+_CONTACT_LINE = re.compile(r"@|\d{3}[\s.-]?\d{4}|^https?://|linkedin\.com", re.IGNORECASE)
+
+
+def _headline_after_name(lines: list[str], name_index: int) -> str | None:
+    """The first real title line under the name, copied whole."""
+    for line in lines[name_index + 1:name_index + 5]:
+        line = line.strip()
+        if not line or line.lower().strip(": ") in _SECTION_HEADINGS:
+            continue
+        if _CONTACT_LINE.search(line):
+            continue
+        # "Mount Pleasant, SC" on its own is the location line, not a headline.
+        match = _CITY_STATE.fullmatch(line)
+        if match and match.group(2) in STATE_CODES:
+            continue
+        if 3 <= len(line) <= 255:
+            return _clean(line)
+    return None
+
+
+def _regex_location(lines: list[str], name_index: int | None, header_end: int) -> dict:
+    """City and state from the header block, falling back to the whole document."""
+    for window in (lines[:header_end], lines):
+        for index, line in enumerate(window):
+            if window is lines and index == name_index:
+                continue
+            match = _CITY_STATE.search(line)
+            if not match:
+                continue
+            city, state = match.group(1).strip(), match.group(2)
+            if state not in STATE_CODES or len(city.split()) > 3:
+                continue
+            # "Gonzalez, RN, BSN" is a credential list, not a city and state.
+            if state in CREDENTIALS and any(
+                token.strip(".,").upper() in CREDENTIALS
+                for token in line.split(",")[2:3] + line.split()[-2:]
+            ):
+                continue
+            return {"city": _title_case(city), "state_code": state}
+    return {}
 
 
 # --- regex extraction of the remaining schema fields -----------------------
@@ -788,34 +1358,104 @@ def _normalize_education(model_value, fallback_value) -> list[dict]:
     return fallback_value if isinstance(fallback_value, list) else []
 
 
+# ---------------------------------------------------------------------------
+# Specialty
+#
+# Most resumes never write the word "specialty", so the model is asked for the
+# candidate's field and this fills the gap when it declines. Each entry maps
+# evidence words to the label used when those words are in the resume -- the
+# label is a category name, not an invention about the candidate, and it is
+# only applied when the resume supplies the evidence.
+
+_SPECIALTY_RULES = (
+    ("Early Childhood Education", (
+        "infant room", "preschool", "toddler", "early childhood", "daycare",
+        "day care", "childcare", "child care", "kinder", "pre-k", "nursery")),
+    ("Special Education", ("special education", "special needs", "autism",
+                           "developmental disabilities", "iep")),
+    ("Childcare", ("nanny", "nannying", "babysitting", "au pair")),
+    ("Nursing", ("registered nurse", " rn ", "bsn", "msn", "lpn", "cna",
+                 "nursing", "patient care", "med surg", "icu", "telemetry")),
+    ("Emergency Medicine", ("emergency department", "emergency room", " er ",
+                            "trauma bay", "paramedic", "emt")),
+    ("Allied Health", ("physical therapy", "occupational therapy",
+                       "respiratory therapy", "radiology", "phlebotomy")),
+    ("Teaching", ("teacher", "classroom", "curriculum", "lesson plan",
+                  "instructor", "tutoring")),
+    ("Commercial Driving", ("cdl", "class a driver", "tractor trailer",
+                            "long haul", "bus driver", "delivery driver")),
+    ("Retail Management", ("shift manager", "store manager", "merchandising",
+                           "planograms", "cash register", "retail")),
+    ("Food Service", ("cook", "chef", "kitchen", "cafeteria", "food service",
+                      "barista", "server")),
+    ("Construction & Trades", ("construction", "electrician", "plumbing",
+                               "welding", "hvac", "pipeline", "meter reader")),
+    ("Administrative Support", ("administrative assistant", "office manager",
+                                "receptionist", "data entry", "scheduling")),
+    ("Customer Service", ("customer service", "call center", "customer support",
+                          "help desk")),
+    ("Information Technology", ("software", "developer", "engineer", "devops",
+                                "sql", "python", "network administrator")),
+)
+
+
+def derive_specialty(text: str, headline: str | None, positions: list[dict]) -> str | None:
+    """Last-resort specialty for a resume with no headline line and none stated.
+
+    Normally the specialty is copied straight off the headline line ("Infant
+    room teacher - Creme de la Creme" -> "Infant room teacher"); this only runs
+    when there is no such line to copy.
+
+    Pick the specialty label whose evidence the resume actually contains.
+
+    The most recent job title and the headline are weighted above the rest of
+    the document, so a career changer is filed under what they do now rather
+    than under whichever section happens to be longest.
+    """
+    body = (text or "").lower()
+    recent = " ".join(str(part or "").lower() for part in (
+        headline,
+        positions[0].get("title") if positions else None,
+        positions[0].get("description") if positions else None,
+    ))
+    best_label, best_score = None, 0
+    for label, keywords in _SPECIALTY_RULES:
+        score = 0
+        for keyword in keywords:
+            padded = f" {keyword.strip()} "
+            if padded in f" {recent} ":
+                score += 3
+            elif keyword.strip() in body:
+                score += 1
+        if score > best_score:
+            best_label, best_score = label, score
+    # One passing mention somewhere in a long skills list is not a specialty.
+    return best_label if best_score >= 2 else None
+
+
 def normalize_profile(raw: dict, text: str) -> dict:
-    """Merge model output with regex fallbacks into the canonical field set."""
-    raw = raw or {}
+    """Merge model output with regex fallbacks into the canonical field set.
+
+    The model wins wherever it produced a value; the regex pass fills the gaps
+    and tops up individual blank fields inside a position. Everything then goes
+    through schema validation, which drops values the resume does not support
+    and clamps the rest to their column widths -- so a weak pass can only leave
+    a field NULL, never write something wrong into it.
+    """
+    model = field_schema.coerce_raw_profile(raw)
+    pass_errors = (raw or {}).get("_pass_errors") or []
     fallback = regex_profile(text)
 
-    full_name = _clean(raw.get("full_name")) or _clean(fallback.get("full_name"))
-    first = _clean(raw.get("first_name"))
-    last = _clean(raw.get("last_name"))
-    if not first or not last:
-        derived_first, derived_last = split_full_name(full_name)
-        first = first or derived_first
-        last = last or derived_last
-    if not full_name and (first or last):
-        full_name = " ".join(part for part in (first, last) if part)
+    full_name = model.get("full_name") or fallback.get("full_name")
+    first, last = split_full_name(full_name)
 
-    bio = _clean(raw.get("bio")) or _clean(fallback.get("bio"))
-    if bio and len(bio) > 4000:
-        bio = bio[:4000].rsplit(" ", 1)[0]
-
-    # Positions from the model win, but the regex pass fills in a missing list
-    # and its entries top up any field the model left blank.
-    model_positions = raw.get("positions") if isinstance(raw.get("positions"), list) else []
-    positions = _dedupe_positions(model_positions) or []
+    # Positions: the model's list wins, the regex list fills in what it missed.
+    positions = _dedupe_positions(model.get("positions") or [])
     fallback_positions = fallback.get("positions") or []
     if not positions:
         positions = fallback_positions
     else:
-        by_key = {_position_key(p): p for p in positions}
+        by_key = {_position_key(position): position for position in positions}
         for candidate in fallback_positions:
             existing = by_key.get(_position_key(candidate))
             if existing is None:
@@ -825,38 +1465,107 @@ def normalize_profile(raw: dict, text: str) -> dict:
                 if value and not existing.get(field):
                     existing[field] = value
 
+    # The full headline line, not just the job title. The regex pass reads it
+    # straight off the line under the name, which is the most faithful source.
     headline = (
-        _clean(raw.get("headline"))
-        or (positions[0].get("title") if positions else None)
-        or _clean(fallback.get("headline"))
+        model.get("headline")
+        or fallback.get("headline")
+        or (_position_headline(positions[0]) if positions else None)
     )
 
-    email = _clean(raw.get("email")) or fallback.get("email")
+    bio = model.get("bio") or fallback.get("bio")
+    if bio and len(bio) > 4000:
+        bio = bio[:4000].rsplit(" ", 1)[0]
+
+    email = model.get("email") or fallback.get("email")
     if email and not _EMAIL.fullmatch(email):
         email = fallback.get("email")
 
-    return {
+    # Specialty is the candidate's own job title off the headline line, which
+    # reads "Specialty - Current organization" -- not a broader category. In
+    # priority order: what the model read, what the regex pass read off that
+    # same line, the line split here as a backstop, and only then a category
+    # derived from the resume's keywords.
+    headline_specialty, headline_employer = split_headline(headline)
+    specialty = model.get("specialty") or fallback.get("specialty") or headline_specialty
+    specialty_source = (
+        "model" if model.get("specialty")
+        else "regex" if fallback.get("specialty")
+        else "headline" if headline_specialty
+        else None
+    )
+    if not specialty:
+        specialty = derive_specialty(text, headline, positions)
+        specialty_source = "derived" if specialty else None
+
+    current_employer = (
+        model.get("current_employer")
+        or fallback.get("current_employer")
+        or headline_employer
+        or (positions[0].get("employer") if positions else None)
+    )
+
+    fields = {
         "first_name": _title_case(first),
         "last_name": _title_case(last),
         "full_name": _title_case(full_name),
         "email": (email or "").lower() or None,
-        "phone": _clean(raw.get("phone")) or fallback.get("phone"),
-        "city": _title_case(_clean(raw.get("city")) or fallback.get("city")),
-        "state_code": normalize_state(raw.get("state_code")) or fallback.get("state_code"),
-        "zip_code": _clean(raw.get("zip_code")) or fallback.get("zip_code"),
+        "phone": model.get("phone") or fallback.get("phone"),
+        "city": _title_case(model.get("city") or fallback.get("city")),
+        "state_code": normalize_state(model.get("state_code")) or fallback.get("state_code"),
+        "zip_code": model.get("zip_code") or fallback.get("zip_code"),
         "headline": headline,
-        "specialty": _clean(raw.get("specialty")) or _clean(fallback.get("specialty")),
-        "profession_type": _clean(raw.get("profession_type")),
-        "work_authorization": (
-            _clean(raw.get("work_authorization")) or fallback.get("work_authorization")
-        ),
+        "specialty": specialty,
+        "current_employer": current_employer,
+        "profession_type": model.get("profession_type"),
+        "work_authorization": model.get("work_authorization") or fallback.get("work_authorization"),
         "bio": bio,
         "certifications": _merge_lists(
-            raw.get("certifications"), fallback.get("certifications"), limit=100),
-        "skills": _merge_lists(raw.get("skills"), fallback.get("skills"), limit=200),
-        "languages": _merge_lists(raw.get("languages"), fallback.get("languages"), limit=30),
-        "education": _normalize_education(raw.get("education"), fallback.get("education")),
+            model.get("certifications"), fallback.get("certifications"), limit=100),
+        "skills": _merge_lists(model.get("skills"), fallback.get("skills"), limit=200),
+        "languages": _merge_lists(model.get("languages"), fallback.get("languages"), limit=30),
+        "education": _normalize_education(model.get("education"), fallback.get("education")),
         "positions": positions,
-        "_model_total_years": raw.get("total_years_experience"),
+        "_specialty_source": specialty_source,
+        "_model_total_years": model.get("total_years_experience"),
         "_model_positions": positions,
+        "_pass_errors": pass_errors,
     }
+
+    fields, notes = field_schema.validate_profile(fields, text)
+
+    # Anything validation removed was the model's invention. The regex pass
+    # reads only from the resume, so its value for that field is grounded by
+    # construction and is the right thing to fall back to -- leaving the column
+    # NULL would lose a value the resume plainly contains.
+    for field in ("city", "headline", "work_authorization", "bio"):
+        if not fields.get(field) and fallback.get(field):
+            fields[field] = field_schema.truncate(
+                fallback[field], field_schema.PROFILE_LIMITS.get(field, 10_000))
+            notes.append(f"restored {field} from the regex pass")
+    if fields.get("city") and not fields.get("state_code"):
+        fields["state_code"] = fallback.get("state_code")
+    if not fields.get("specialty"):
+        from_headline, _employer = split_headline(fields.get("headline"))
+        if fallback.get("specialty"):
+            fields["specialty"] = fallback["specialty"]
+            fields["_specialty_source"] = "regex"
+        elif from_headline:
+            fields["specialty"] = field_schema.truncate(
+                from_headline, field_schema.PROFILE_LIMITS["specialty"])
+            fields["_specialty_source"] = "headline"
+
+    # Validation may still have removed a headline or specialty the resume did
+    # not support. Rebuild those from evidence rather than leaving a hole.
+    if not fields.get("headline") and fields.get("positions"):
+        fields["headline"] = field_schema.truncate(
+            _position_headline(fields["positions"][0]), field_schema.PROFILE_LIMITS["headline"])
+    if not fields.get("specialty"):
+        # Last resort only: a resume with no headline line and no stated
+        # specialty still gets filed under a field its own words support.
+        derived = derive_specialty(text, fields.get("headline"), fields.get("positions") or [])
+        if derived:
+            fields["specialty"] = derived
+            fields["_specialty_source"] = "derived"
+    fields["_schema_notes"] = notes
+    return fields
