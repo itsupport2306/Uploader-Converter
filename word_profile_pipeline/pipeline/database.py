@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from . import config
 from .schema import PROFILE_LIMITS, WORK_HISTORY_LIMITS, truncate
+#git issue
 
 PROFILE_NAMESPACE = uuid.UUID("6f9b1a6e-6f0e-5f6b-9a0e-2f1c3d4e5a6b")
 
