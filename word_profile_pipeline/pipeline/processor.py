@@ -1,0 +1,420 @@
+"""Orchestration: SharePoint DOCX -> extract -> profile ID -> R2 -> Neon."""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from time import monotonic
+
+from . import config, database, docx_text, experience, llm_extract, run_log, sharepoint, storage
+from .sharepoint import DocxSource
+
+TERMINAL_STATUSES = {"processed", "skipped_duplicate"}
+
+# Words a resume file name carries around the candidate's actual name.
+_FILE_NAME_NOISE = {
+    "profile", "resume", "cv", "curriculum", "vitae", "copy", "final", "updated",
+    "new", "doc", "docx", "pdf", "indeed", "linkedin", "signed", "draft",
+}
+
+
+# With two workers the per-record progress lines from both interleave, which
+# makes a run log unreadable. Each record collects its own lines and they are
+# printed as one block when that record finishes.
+_print_lock = threading.Lock()
+
+
+class Reporter:
+    """Per-record output buffer, flushed as one block under a shared lock."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def say(self, message: str) -> None:
+        self.lines.append(message)
+
+    def flush(self, header: str) -> None:
+        with _print_lock:
+            print(header)
+            for line in self.lines:
+                print(line)
+        self.lines.clear()
+
+
+def _name_from_file_name(file_name: str | None) -> tuple[str, str] | None:
+    """'Donna-Omara-profile.docx' -> ('Donna', 'Omara'). None if it is not a name."""
+    stem = Path(file_name or "").stem
+    words = [word for word in re.split(r"[^A-Za-z]+", stem) if len(word) > 1]
+    words = [word for word in words if word.lower() not in _FILE_NAME_NOISE]
+    if len(words) < 2:
+        return None
+    return words[0].capitalize(), words[1].capitalize()
+
+
+def validate_fields(fields: dict) -> tuple[bool, list[str]]:
+    """Gate the database write. Returns (ok, problems).
+
+    Only checks what the schema truly requires: first and last name are NOT NULL
+    in profiles, so a row without them cannot be written at all. Everything else
+    is reported as a note and still stored.
+    """
+    problems: list[str] = []
+    if not fields.get("first_name"):
+        problems.append("no first name could be extracted")
+    if not fields.get("last_name"):
+        problems.append("no last name could be extracted")
+
+    notes: list[str] = []
+    for label, key in (("city/state", "city"), ("bio", "bio"), ("work history", "positions")):
+        if not fields.get(key):
+            notes.append(f"no {label}")
+    fields["_validation_notes"] = notes
+    return not problems, problems
+
+
+def _extract_fields(text: str, *, use_llm: bool, say=print) -> tuple[dict, str, str | None]:
+    """Return (fields, extraction_mode, llm_error)."""
+    raw: dict = {}
+    mode = "regex"
+    llm_error = None
+
+    if use_llm:
+        try:
+            raw = llm_extract.extract_profile(text)
+            mode = f"qwen:{llm_extract.model_name()}"
+            # A pass that failed on its own is not a failed extraction: the
+            # other passes still ran and the regex fallback covers the gap.
+            partial = raw.get("_pass_errors") or []
+            if partial:
+                llm_error = "; ".join(partial)
+                mode += "+partial"
+                say(f"  note: {len(partial)} extraction pass(es) fell back to regex: {llm_error}")
+        except llm_extract.LlmError as exc:
+            llm_error = str(exc)
+            mode = "regex_fallback"
+            say(f"  warning: model extraction failed, falling back to regex: {exc}")
+
+    fields = llm_extract.normalize_profile(raw, text)
+    years, detail = experience.resolve_years_experience(
+        text,
+        model_total=fields.pop("_model_total_years", None),
+        model_positions=fields.pop("_model_positions", []),
+    )
+    fields["years_experience"] = years
+    fields["_experience_detail"] = detail
+    return fields, mode, llm_error
+
+
+def process_one(
+    *,
+    source: DocxSource,
+    graph_client,
+    engine,
+    args: argparse.Namespace,
+    reporter: "Reporter | None" = None,
+) -> dict:
+    say = reporter.say if reporter is not None else print
+    record = {
+        "record_id": source.record_id,
+        "source_file": source.source_file,
+        "display_name": source.display_name,
+        "file_name": source.file_name,
+        "logged_at": run_log.utc_iso(),
+    }
+
+    docx_bytes = sharepoint.read_docx_bytes(graph_client, source)
+    digest = storage.sha256_bytes(docx_bytes)
+    sections = docx_text.section_count(docx_bytes)
+    text = docx_text.extract_text(docx_bytes)
+
+    record.update({"docx_sha256": digest, "docx_sections": sections, "docx_bytes": len(docx_bytes)})
+    record["text_source"] = "docx_text"
+    record["ocr_error"] = None
+
+    fields, mode, llm_error = _extract_fields(text, use_llm=args.use_llm, say=say)
+    experience_detail = fields.pop("_experience_detail", {})
+
+    # Last resort so a weak document still lands as a real row: the source
+    # file name is genuine information about the candidate, unlike a guess.
+    if not (fields.get("first_name") and fields.get("last_name")):
+        derived = _name_from_file_name(source.file_name or source.display_name)
+        if derived:
+            fields.setdefault("_name_source", "file_name")
+            fields["first_name"] = fields.get("first_name") or derived[0]
+            fields["last_name"] = fields.get("last_name") or derived[1]
+            fields["full_name"] = fields.get("full_name") or " ".join(derived)
+            say(f"  no name in the text; using the file name: {' '.join(derived)}")
+
+    ok, problems = validate_fields(fields)
+    record["validation"] = problems
+    if not ok:
+        return {
+            **record,
+            "status": "skipped_unusable",
+            "error": "; ".join(problems),
+            "extraction_mode": mode,
+            "llm_error": llm_error,
+        }
+
+    profile_id = database.profile_id_for(digest)
+
+    key = storage.key_for(digest, fields.get("specialty"), fields.get("state_code"))
+    record.update({
+        "profile_id": profile_id,
+        "first_name": fields.get("first_name"),
+        "last_name": fields.get("last_name"),
+        "full_name": fields.get("full_name"),
+        "email": fields.get("email"),
+        "phone": fields.get("phone"),
+        "city": fields.get("city"),
+        "state_code": fields.get("state_code"),
+        "zip_code": fields.get("zip_code"),
+        "headline": fields.get("headline"),
+        "specialty": fields.get("specialty"),
+        "current_employer": fields.get("current_employer"),
+        "profession_type": fields.get("profession_type"),
+        "work_authorization": fields.get("work_authorization"),
+        "years_experience": fields.get("years_experience"),
+        "years_experience_source": experience_detail.get("chosen_kind"),
+        "years_experience_detail": experience_detail,
+        "bio_chars": len(fields.get("bio") or ""),
+        "positions": len(fields.get("positions") or []),
+        "certifications": len(fields.get("certifications") or []),
+        "skills": len(fields.get("skills") or []),
+        "education_entries": len(fields.get("education") or []),
+        "languages": len(fields.get("languages") or []),
+        "extraction_mode": mode,
+        "llm_error": llm_error,
+        "cloudflare_key": key,
+        "resume_url": storage.url_for_key(key),
+    })
+
+    if args.dry_run:
+        return {**record, "status": "would_process"}
+
+    say(f"  uploading original DOCX to Cloudflare R2: {key}")
+    resume_url, uploaded_now = storage.upload_docx(docx_bytes, key)
+    record.update({"resume_url": resume_url, "cloudflare_uploaded": uploaded_now})
+
+    resume_sections = {
+        "raw_extracted_text": text,
+        "source_file": source.source_file,
+        "source_display_name": source.display_name,
+        "docx_file_name": source.file_name,
+        "docx_sha256": digest,
+        "docx_sections": sections,
+        "cloudflare_bucket": os.environ.get("S3_BUCKET"),
+        "cloudflare_key": key,
+        "extraction_mode": mode,
+        "text_source": "docx_text",
+        "experience_decision": experience_detail,
+        "full_name": fields.get("full_name"),
+        # The structured resume content, kept alongside the flat columns.
+        "summary": fields.get("bio"),
+        "work_experience": fields.get("positions") or [],
+        "certifications": fields.get("certifications") or [],
+        "skills": fields.get("skills") or [],
+        "languages": fields.get("languages") or [],
+        "education": fields.get("education") or [],
+        "contact": {
+            "email": fields.get("email"),
+            "phone": fields.get("phone"),
+            "city": fields.get("city"),
+            "state_code": fields.get("state_code"),
+            "zip_code": fields.get("zip_code"),
+        },
+        "work_authorization": fields.get("work_authorization"),
+        "extraction_notes": fields.get("_validation_notes") or [],
+        # What schema validation removed or shortened, so a NULL column can be
+        # traced back to "the resume did not support it" rather than a bug.
+        "schema_notes": fields.get("_schema_notes") or [],
+        "specialty_source": fields.get("_specialty_source"),
+        # The headline line reads "Specialty - Current organization"; this is
+        # the organization half. profiles has no column for it.
+        "current_employer": fields.get("current_employer"),
+        "name_source": fields.get("_name_source") or "resume_text",
+        "ocr_error": None,
+        "llm_error": llm_error,
+    }
+
+    with engine.begin() as conn:
+        existing_id = database.find_existing_profile_id(
+            conn, args.target_table, profile_id=profile_id, digest=digest, fields=fields,
+        )
+        stored_id, db_action = database.upsert_profile(
+            conn,
+            table_name=args.target_table,
+            profile_id=profile_id,
+            existing_id=existing_id,
+            fields=fields,
+            resume_sections=resume_sections,
+            resume_url=resume_url,
+        )
+        work_added = database.sync_work_history(
+            conn, profile_id=stored_id, positions=fields.get("positions") or [],
+        )
+
+    return {
+        **record,
+        "status": "processed",
+        "profile_id": stored_id,
+        "db_action": db_action,
+        "work_history_added": work_added,
+        "uploaded_at": run_log.utc_iso(),
+    }
+
+
+def _label(source: DocxSource) -> str:
+    return Path(source.display_name).name or source.display_name
+
+
+def discover(args: argparse.Namespace) -> tuple[list[DocxSource], object]:
+    if sharepoint.is_remote_input(args.input):
+        client = sharepoint.build_client(
+            client_id=args.onedrive_client_id,
+            tenant=args.onedrive_tenant,
+            client_secret=args.onedrive_client_secret,
+            open_browser=not args.no_browser,
+        )
+        print("Input mode: SharePoint/OneDrive shared URL")
+        return sharepoint.iter_remote_docx(client, args.input, args.limit), client
+
+    print("Input mode: local DOCX file/folder")
+    return sharepoint.iter_local_docx(Path(args.input).expanduser(), args.limit), None
+
+
+def run(args: argparse.Namespace) -> dict:
+    env_file = config.load_env(args.env_file)
+    print(f"Env file: {env_file}{'' if env_file.exists() else ' (not found; using process environment)'}")
+
+    # database.create_engine reads this to size the connection pool.
+    os.environ["PIPELINE_WORKERS"] = str(max(1, args.workers))
+    args.use_llm = llm_extract.llm_enabled() and not args.no_llm
+    config.validate_env(dry_run=args.dry_run, use_llm=args.use_llm)
+
+    if args.use_llm:
+        print(f"Extraction model: {llm_extract.model_name()} @ {os.environ.get('LLM_BASE_URL')}")
+    else:
+        print("Extraction model: disabled (regex-only extraction)")
+    if not args.dry_run:
+        print(f"Database: {config.safe_db_label(config.normalize_db_url(os.environ.get('DATABASE_URL', '')))}")
+        print(f"Cloudflare R2 bucket: {os.environ.get('S3_BUCKET')}")
+
+    manifest_path = run_log.optional_path(args.manifest, config.ROOT / "logs" / "profiles_manifest.jsonl")
+    csv_path = run_log.optional_path(args.upload_log, config.ROOT / "logs" / "upload_log.csv")
+
+    sources, graph_client = discover(args)
+
+    latest = {} if args.ignore_manifest else run_log.latest_status(manifest_path)
+    required = [
+        source for source in sources
+        if args.retry_all or latest.get(source.record_id, {}).get("status") not in TERMINAL_STATUSES
+    ]
+    print(f"Found {len(sources)} DOCX file(s); {len(required)} require processing.")
+    if args.dry_run:
+        print("Dry run: read and extract only. No Cloudflare upload, no database write.")
+
+    engine = None
+    if not args.dry_run:
+        engine = database.create_engine()
+        database.ensure_table(engine, args.target_table)
+        print(f'Target table: "{args.target_table}"')
+
+    stats = {"processed": 0, "skipped": 0, "failed": 0, "total": len(required)}
+    started = monotonic()
+    workers = max(1, min(args.workers, len(required) or 1))
+    if required:
+        print(f"Starting processing with {workers} worker(s)...")
+        if workers > 1:
+            print(f"  model calls are capped at "
+                  f"{config.env_int('LLM_MAX_CONCURRENCY', 1)} concurrent request(s); "
+                  "download and R2 upload run in parallel.")
+
+    def _log(record: dict) -> None:
+        if manifest_path is not None:
+            run_log.append_manifest(manifest_path, record)
+        if csv_path is not None:
+            run_log.append_csv(csv_path, record)
+
+    def _on_success(index: int, source: DocxSource, record: dict) -> None:
+        status = record["status"]
+        _log(record)
+        if status in {"processed", "would_process"}:
+            stats["processed"] += 1
+            note = f" -> {record.get('profile_id')} ({record.get('db_action', 'dry-run')})"
+            years = record.get("years_experience")
+            print(f"[{index}/{len(required)}] {status.upper()} {_label(source)}{note} "
+                  f"| yrs={years} via {record.get('years_experience_source')}")
+        else:
+            stats["skipped"] += 1
+            print(f"[{index}/{len(required)}] SKIP {_label(source)}: {status} - {record.get('error', '')}")
+
+    def _on_failure(index: int, source: DocxSource, exc: Exception) -> None:
+        stats["failed"] += 1
+        record = {
+            "record_id": source.record_id,
+            "source_file": source.source_file,
+            "display_name": source.display_name,
+            "status": "failed",
+            "error": str(exc),
+            "logged_at": run_log.utc_iso(),
+        }
+        _log(record)
+        print(f"[{index}/{len(required)}] FAIL {_label(source)}: {exc}")
+
+    def _run_one(index: int, source: DocxSource):
+        """One record, with its progress lines buffered until it finishes."""
+        reporter = Reporter()
+        try:
+            record = process_one(
+                source=source, graph_client=graph_client, engine=engine,
+                args=args, reporter=reporter,
+            )
+        except Exception as exc:
+            reporter.flush(f"[{index}/{len(required)}] Reading {_label(source)}")
+            return exc
+        reporter.flush(f"[{index}/{len(required)}] Reading {_label(source)}")
+        return record
+
+    if workers == 1:
+        for index, source in enumerate(required, start=1):
+            outcome = _run_one(index, source)
+            if isinstance(outcome, Exception):
+                _on_failure(index, source, outcome)
+            else:
+                _on_success(index, source, outcome)
+    else:
+        # Threads, not processes: the work is I/O bound (Graph download, R2
+        # upload, the model call). Everything shared is either immutable
+        # (args, sources) or
+        # explicitly synchronised: the SQLAlchemy pool hands each thread its own
+        # connection, run_log writes under a lock, the boto3 client is built
+        # once under a lock, and model calls pass through a semaphore.
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="word-worker") as executor:
+            futures = {
+                executor.submit(_run_one, index, source): (index, source)
+                for index, source in enumerate(required, start=1)
+            }
+            for future in as_completed(futures):
+                index, source = futures[future]
+                try:
+                    outcome = future.result()
+                except Exception as exc:  # a crash inside _run_one itself
+                    _on_failure(index, source, exc)
+                    continue
+                if isinstance(outcome, Exception):
+                    _on_failure(index, source, outcome)
+                else:
+                    _on_success(index, source, outcome)
+
+    elapsed = max(monotonic() - started, 0.001)
+    print(f"\nSummary: {stats}")
+    print(f"Elapsed: {elapsed / 60:.1f} min ({len(required) / elapsed:.2f} records/sec)")
+    if manifest_path is not None:
+        print(f"Manifest: {manifest_path}")
+    if csv_path is not None:
+        print(f"Upload log: {csv_path}")
+    return stats
