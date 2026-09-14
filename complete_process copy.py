@@ -612,6 +612,14 @@ def _process_one(
 
     if source.is_remote:
         image_bytes = _download_remote_image_bytes(onedrive_client, source)
+        # Hash the source screenshot, not the generated DOCX: python-docx's zip
+        # writer stamps every internal entry with the current time, so the same
+        # image reconverted on a retry yields different DOCX bytes/digest even
+        # though the content is identical. Hashing the (stable) source bytes
+        # keeps the Cloudflare key and Neon dedup match consistent across
+        # reprocessing, so a re-run updates the same profile instead of
+        # inserting a duplicate.
+        digest = uploader._sha256_bytes(image_bytes)
         print(f"Running OCR and DOCX conversion: {source.display_name}")
         docx_bytes = converter.convert_bytes(
             image_bytes,
@@ -622,13 +630,15 @@ def _process_one(
             min_conf=args.min_conf,
             debug=args.debug,
         )
-        digest = uploader._sha256_bytes(docx_bytes)
         text = uploader.extract_docx_text_bytes(docx_bytes)
     else:
         if output_dir is None or source.local_path is None:
             raise RuntimeError("Local processing requires a concrete output directory and source path.")
         docx_path = _docx_path_for(source.local_path, output_dir)
         base["docx_file"] = str(docx_path)
+        # See the remote branch above: digest is taken from the source
+        # screenshot (stable across reconversions), not the generated DOCX.
+        digest = uploader._sha256_file(source.local_path)
         if not docx_path.exists() or args.force_convert:
             converter.convert(
                 source.local_path,
@@ -639,7 +649,6 @@ def _process_one(
                 min_conf=args.min_conf,
                 debug=args.debug,
             )
-        digest = uploader._sha256_file(docx_path)
         text = uploader.extract_text(docx_path)
         docx_bytes = None
 
