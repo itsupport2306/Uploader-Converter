@@ -4,13 +4,18 @@ screenshot_to_word.py
 Convert Doximity-style physician-profile screenshots or NPPES-style Excel rows
 into clean, editable Word (.docx) documents.
 
-The tool:
-  1. De-inverts the dark header band so white-on-dark text (the name) is read.
-  2. Detects the column gap and drops the right sidebar (contact info + the
-     "Similar Physicians & HCPs" list) plus join/promo call-to-actions.
-  3. Rebuilds document structure (name, specialty, sections, and the entries
-     inside each section) from OCR word boxes.
-  4. Renders a formatted .docx that mirrors the on-screen layout.
+The tool works from the page *layout* rather than fixed keywords, so it copes
+with any resolution, zoom level, dark/light theme, cropped sidebar, or extra
+browser chrome:
+  1. Picks an OCR upscale from the image width; de-inverts a dark header band
+     (or a whole dark-mode page) so light-on-dark text is read.
+  2. Detects the main/sidebar column gap from word coverage; when there is no
+     sidebar nothing is cropped. The sidebar's contact card is OCR'd separately.
+  3. Finds the name as the largest text in the top half of the page, drops
+     everything above it (logo, browser bars) and the avatar alt-text beside it.
+  4. Removes the join/promo box as a spatial cluster, recognises section
+     headings by size + surrounding whitespace, and groups entries by spacing.
+  5. Renders a formatted .docx that mirrors the on-screen layout.
 
 Usage:
     python screenshot_to_word.py INPUT [-o OUTPUT] [options]
@@ -112,12 +117,41 @@ KNOWN_HEADINGS = [
     "Awards, Honors, & Recognition",
     "Publications & Presentations",
     "Professional Memberships",
+    "Hospital Affiliations",
+    "Board Certifications",
+    "Clinical Interests",
+    "Practice Locations",
+    "Practice Address",
     "Languages",
 ]
 
 # Sub-headings rendered smaller/bold inside a section (e.g. the source of a
 # publication list). Kept as bold lead-ins rather than top-level headings.
-KNOWN_SUBHEADINGS = ["PubMed", "Other"]
+KNOWN_SUBHEADINGS = [
+    "PubMed",
+    "Other",
+    "Journal Articles",
+    "Abstracts/Posters",
+    "Book Chapters",
+    "Books",
+    "Lectures",
+    "Presentations",
+    "Press Mentions",
+    "Posters",
+]
+
+# Typography ratios (relative to the median body glyph height) that separate
+# the name, section headings and body text on a profile page. They are ratios
+# so they hold at any screenshot resolution or browser zoom.
+NAME_MIN_RATIO = 1.3        # the name is the largest text on the page
+HEADING_MIN_RATIO = 1.12    # section headings are a step up from body text
+SECTION_GAP_RATIO = 1.8     # whitespace above/below a heading vs. line height
+CLUSTER_GAP_RATIO = 3.0     # gap that separates one card/paragraph from the next
+SEGMENT_GAP_RATIO = 2.5     # horizontal gap that splits a row into two columns
+
+# OCR reads best when body glyphs are ~20-30 px tall; this is the page width
+# at which a normal desktop screenshot lands there after a 1.5x upscale.
+OCR_TARGET_WIDTH = 2850
 
 # Promotional / navigational lines that belong to Doximity's chrome, not the
 # physician's data. Dropped unless --keep-promo is given. Matched as a
@@ -172,6 +206,7 @@ class Line:
     right: int
     bottom: int
     height: int          # median glyph height (font-size proxy)
+    words: list = field(default_factory=list, repr=False)   # source OCR boxes
 
     @property
     def width(self) -> int:
@@ -227,12 +262,20 @@ def configure_tesseract(explicit: str | None = None) -> None:
 # Image preprocessing
 # --------------------------------------------------------------------------- #
 
-def load_image(path: Path | str | bytes | bytearray, scale: float) -> Image.Image:
+def auto_scale(width: int) -> float:
+    """Upscale factor that brings a screenshot of any width into the glyph-size
+    band Tesseract reads best (small windows up, retina shots left alone)."""
+    return max(1.0, min(2.5, OCR_TARGET_WIDTH / max(1, width)))
+
+
+def load_image(path: Path | str | bytes | bytearray, scale: float | None) -> Image.Image:
     if isinstance(path, (bytes, bytearray)):
         img = Image.open(io.BytesIO(path)).convert("RGB")
     else:
         img = Image.open(path).convert("RGB")
-    if scale and abs(scale - 1.0) > 1e-3:
+    if not scale or scale <= 0:
+        scale = auto_scale(img.width)
+    if abs(scale - 1.0) > 1e-3:
         img = img.resize(
             (int(img.width * scale), int(img.height * scale)), Image.LANCZOS
         )
@@ -266,6 +309,11 @@ def deinvert_dark_header(img: Image.Image, dark_thresh: int = 110) -> tuple[Imag
     if end <= 0:
         return img, 0
 
+    # The band ran into the 30% cap: this is a dark-mode page, not a header.
+    # Invert the whole image so every line reads as dark-on-light.
+    if end >= int(h * 0.30) - 1 and np.median(gray) < dark_thresh:
+        return ImageOps.invert(img), 0
+
     out = img.copy()
     band = out.crop((0, 0, out.width, end + 1))
     out.paste(ImageOps.invert(band), (0, 0))
@@ -293,6 +341,7 @@ def ocr_words(img: Image.Image, psm: int = 3, min_conf: int = 35) -> list[dict]:
         words.append(
             {
                 "text": text,
+                "conf": conf,
                 "left": data["left"][i],
                 "top": data["top"][i],
                 "width": data["width"][i],
@@ -305,43 +354,84 @@ def ocr_words(img: Image.Image, psm: int = 3, min_conf: int = 35) -> list[dict]:
     return words
 
 
-def find_column_cutoff(
-    words: list[dict], img_w: int, header_end: int, default_ratio: float
-) -> int:
-    """Find the x splitting the main column from the right sidebar.
+def keep_confident_or_large(words: list[dict], min_conf: int) -> list[dict]:
+    """Apply the confidence floor, but keep large-type words regardless.
 
-    Looks for the widest vertical whitespace gap in the right half of the body
-    region. Falls back to ``default_ratio`` * width when detection is unclear.
+    The name is the biggest text on the page and OCR often scores it low
+    (a glued avatar glyph, anti-aliasing at odd zoom levels). Losing it is
+    far worse than keeping a large noise token, which later stages filter
+    by shape anyway.
     """
-    fallback = int(img_w * default_ratio)
+    sure = [w for w in words if w["conf"] >= min_conf]
+    if not sure:
+        return sure
+    body_h = float(np.median([w["height"] for w in sure]))
+    tall = NAME_MIN_RATIO * body_h
+
+    def name_like(w: dict) -> bool:
+        # A capitalised word (after any glued icon glyph), not a seal or
+        # badge that OCR rendered as digits/symbols ("4gag,").
+        text = re.sub(r"^[^\w]+", "", w["text"])
+        return bool(re.fullmatch(r"[A-Z][A-Za-z'.()-]*,?", text))
+
+    return [w for w in words
+            if w["conf"] >= min_conf
+            or (w["conf"] >= 5 and w["height"] >= tall and name_like(w))]
+
+
+def footer_top(words: list[dict], img_h: int) -> int:
+    """y where the site footer starts (full-width nav links / SEO text that
+    would otherwise bridge the column gap), or the image height if none."""
+    tops = [ln.top for ln in group_lines(words, header_end=img_h) if is_footer(ln.text)]
+    return min(tops) if tops else img_h
+
+
+def find_column_cutoff(words: list[dict], img_w: int, img_h: int | None = None) -> int:
+    """Return the x where the main column ends and a right sidebar begins.
+
+    Builds a horizontal coverage profile from the OCR word boxes (above the
+    footer) and looks for the first wide vertical whitespace band, right of
+    the page's left third, that has the dense main column on its left and a
+    real block of text on its right. When no such band exists the page has
+    no sidebar and the full width is returned, so nothing is ever cropped.
+    """
+    if not words:
+        return img_w
+    if img_h is not None:
+        limit = footer_top(words, img_h)
+        words = [w for w in words if w["top"] < limit] or words
     coverage = np.zeros(img_w + 1, dtype=np.int32)
     for w in words:
-        if w["top"] < header_end:          # ignore the header band
-            continue
         l = max(0, w["left"])
         r = min(img_w, w["left"] + w["width"])
         if r > l:
             coverage[l:r] += 1
-
     if coverage.sum() == 0:
-        return fallback
+        return img_w
 
-    covered = coverage > 0
-    search_start = int(img_w * 0.45)        # sidebars live in the right portion
+    # A lone stray token (avatar glyph, icon) must not close a real gap.
+    covered = coverage > 1
     min_gap = max(22, img_w // 60)
+    search_start = int(img_w * 0.35)
+
+    def words_right_of(x: int) -> int:
+        return sum(1 for w in words if w["left"] >= x)
 
     run_start = None
-    for x in range(search_start, img_w):
-        if not covered[x]:
+    for x in range(search_start, img_w + 1):
+        if x < img_w and not covered[x]:
             if run_start is None:
                 run_start = x
-        else:
-            if run_start is not None and x - run_start >= min_gap:
-                # First wide gap after the dense main column = the divider.
-                if coverage[:run_start].sum() > coverage[run_start:].sum() * 0.4:
-                    return run_start
-            run_start = None
-    return fallback
+            continue
+        if run_start is not None and x - run_start >= min_gap:
+            left = int(coverage[:run_start].sum())
+            right = int(coverage[x:].sum())
+            # The sidebar must be a genuine text block, and the main column
+            # must be the dominant one; otherwise keep scanning.
+            if right > 0 and words_right_of(x) >= 3 and left >= right * 0.4:
+                return run_start
+        run_start = None
+    return img_w
 
 
 def clean_text(s: str) -> str:
@@ -361,6 +451,22 @@ def clean_text(s: str) -> str:
 
 def _is_punct(token: str) -> bool:
     return re.sub(r"[\W_]", "", token) == ""
+
+
+# Short lowercase tokens that legitimately start a wrapped line of text; any
+# other 1-2 letter lowercase token in front of a capitalised word is an icon
+# or seal that OCR turned into letters ("ea Fellowship", "j 1977").
+_SHORT_LEAD_WORDS = {
+    "a", "an", "as", "at", "by", "in", "is", "it", "of", "on", "or", "to", "vs",
+}
+
+
+def _is_lead_noise(token: str, following: str) -> bool:
+    if not re.fullmatch(r"[a-z]{1,2}", token):
+        return False
+    if token in _SHORT_LEAD_WORDS:
+        return False
+    return bool(re.match(r"[A-Z0-9]", following))
 
 
 def group_lines(words: list[dict], header_end: int = 0) -> list[Line]:
@@ -405,6 +511,9 @@ def group_lines(words: list[dict], header_end: int = 0) -> list[Line]:
                 continue
             if not short:
                 break
+            if len(ws) >= 2 and _is_lead_noise(w0["text"], ws[1]["text"]):
+                ws = ws[1:]
+                continue
             if len(ws) == 1:
                 # A lone short token whose glyph is far from body size is a logo
                 # (tiny rendered mark like "ABMS", or an oversized icon).
@@ -431,10 +540,44 @@ def group_lines(words: list[dict], header_end: int = 0) -> list[Line]:
         right = max(w["left"] + w["width"] for w in ws)
         bottom = max(w["top"] + w["height"] for w in ws)
         height = int(np.median([w["height"] for w in ws]))
-        lines.append(Line(text, left, top, right, bottom, height))
+        lines.append(Line(text, left, top, right, bottom, height, ws))
 
     lines.sort(key=lambda ln: (ln.top, ln.left))
     return lines
+
+
+def line_segments(ln: Line, body_h: int) -> list[Line]:
+    """Split a row into horizontally separated segments (e.g. an avatar's
+    alt-text box sitting beside the real name). Rows with no wide gap come
+    back as a single segment."""
+    ws = sorted(ln.words, key=lambda w: w["left"])
+    if len(ws) < 2:
+        return [ln]
+    gap_limit = SEGMENT_GAP_RATIO * body_h
+    groups: list[list[dict]] = [[ws[0]]]
+    for w in ws[1:]:
+        prev = groups[-1][-1]
+        if w["left"] - (prev["left"] + prev["width"]) > gap_limit:
+            groups.append([w])
+        else:
+            groups[-1].append(w)
+    if len(groups) == 1:
+        return [ln]
+    segs = []
+    for g in groups:
+        text = clean_text(" ".join(w["text"] for w in g))
+        if not text:
+            continue
+        segs.append(Line(
+            text,
+            min(w["left"] for w in g),
+            min(w["top"] for w in g),
+            max(w["left"] + w["width"] for w in g),
+            max(w["top"] + w["height"] for w in g),
+            int(np.median([w["height"] for w in g])),
+            g,
+        ))
+    return segs or [ln]
 
 
 # --------------------------------------------------------------------------- #
@@ -473,10 +616,12 @@ def _strip_leading_junk(text: str) -> str:
     """Remove a leading icon/OCR artifact from a header line (punctuation run or
     a short lowercase fragment sitting before the first real, capitalized word)."""
     text = re.sub(r"^\s*[^\w\s]+\s*", "", text)
-    duplicate = re.match(r"^([a-z][a-z.'-]{1,30})\s+([A-Z][A-Za-z.'-]*)(.*)$", text)
+    # A leading token carrying OCR-only symbols is an icon, not a word ("a~ J.").
+    text = re.sub(r"^\S*[~=^`{}<>\\|]\S*\s+", "", text)
+    duplicate = re.match(r"^([a-z][a-z.'-]{1,30})\s+(?:[^\w\s]+\s+)?([A-Z][A-Za-z.'-]*)(.*)$", text)
     if duplicate and duplicate.group(1).casefold() == duplicate.group(2).casefold():
         text = f"{duplicate.group(2)}{duplicate.group(3)}"
-    text = re.sub(r"^([a-z]{1,3})\s+(?=[A-Z0-9])", "", text)
+    text = re.sub(r"^([a-z0-9]{1,3})\s+(?=[A-Z0-9])", "", text)
     return text.strip()
 
 
@@ -547,69 +692,266 @@ def match_subheading(text: str) -> str | None:
     return None
 
 
-# Trigger phrases that mark the *start* of Doximity's join/promo box, used to
-# find the header/body boundary on light-header profile pages where there is
-# no dark band to de-invert. The bare "oximity" brand-name snippet is excluded
-# because it also matches the logo line sitting above the real name/subtitle.
-_HEADER_END_TRIGGERS = [_norm(p) for p in PROMO_SNIPPETS if p != "oximity"]
-
-# Bare alt-text/logo artifacts that sometimes OCR as their own short header
-# line (e.g. a broken "Doximity Logo" image); never real name/specialty text.
+# Bare alt-text/logo artifacts that sometimes OCR as their own short line
+# (e.g. a broken "Doximity Logo" image); never real name/specialty text.
 _HEADER_JUNK_LINES = {"logo", "doximity logo"}
 
+# Characters that only ever come from OCR-ing a broken image or an icon.
+_OCR_SYMBOL_RE = re.compile(r"[@{}<>~^`\\=]")
 
-def infer_header_end(lines: list[Line]) -> int:
-    """Find where the header (name/specialty/location) ends on pages with no
-    dark header band, by locating the first join/promo-box line."""
-    for ln in lines:
-        n = _norm(ln.text)
-        if not n:
+
+@dataclass
+class HeaderSpan:
+    """Vertical extent of the profile header (name + specialty lines)."""
+    title_top: int
+    title_left: int
+    end: int             # y where the body starts
+
+
+def body_glyph_height(lines: list[Line]) -> int:
+    return int(np.median([ln.height for ln in lines])) if lines else 12
+
+
+def _name_score(seg: Line) -> tuple:
+    """Rank a row segment as the profile name: a degree credential near the
+    end wins, then a multi-word segment, then glyph height. (An avatar's
+    alt-text box beside the name is a single word and can be *taller*.)"""
+    return (_looks_like_name(seg.text), len(seg.text.split()) >= 2, seg.height, len(seg.text))
+
+
+def _name_segment(ln: Line, body_h: int) -> Line | None:
+    """The part of a header row that could be the name: segments made of OCR
+    symbols or all-lowercase alt-text are not eligible."""
+    segs = []
+    for s in line_segments(ln, body_h):
+        text = _strip_leading_junk(s.text)
+        if not text or _OCR_SYMBOL_RE.search(text) or text == text.lower():
             continue
-        if any(trigger in n for trigger in _HEADER_END_TRIGGERS) or match_heading(ln.text):
-            return ln.top
-    return 0
+        segs.append(Line(text, s.left, s.top, s.right, s.bottom, s.height, s.words))
+    return max(segs, key=_name_score) if segs else None
 
 
-def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[Block]:
+def _pick_title(cands: list[Line]) -> Line | None:
+    return max(cands, key=lambda ln: _name_score(ln) + (-ln.top,)) if cands else None
+
+
+def locate_header(lines: list[Line], img_h: int, body_h: int) -> HeaderSpan | None:
+    """Find the profile header from layout alone.
+
+    The name is the largest text in the upper half of the page (excluding site
+    chrome such as the logo, browser bars or promo lines). The header ends at
+    the first promo/join line or section heading below it, or after a page
+    gap if neither is present. Anything above the name is not profile data.
+    """
+    if not lines:
+        return None
+    limit = img_h * 0.5
+    cands: list[Line] = []
+    for ln in lines:
+        if ln.top > limit:
+            break
+        if ln.height < NAME_MIN_RATIO * body_h:
+            continue
+        if is_promo(ln.text) or is_footer(ln.text) or match_heading(ln.text):
+            continue
+        n = _norm(ln.text)
+        if n in _HEADER_JUNK_LINES or len(n) < 3 or not re.search(r"[A-Za-z]{2}", ln.text):
+            continue
+        # Judge the name on its own segment so a big avatar box beside it can
+        # neither hide the credential nor supply a bogus height.
+        seg = _name_segment(ln, body_h)
+        if seg is None or seg.height < NAME_MIN_RATIO * body_h:
+            continue
+        cands.append(seg)
+    title = _pick_title(cands)
+    if title is None:
+        return None
+
+    end = None
+    last_bottom = title.bottom
+    for ln in lines:
+        if ln.top <= title.top:
+            continue
+        if is_promo(ln.text) or match_heading(ln.text) or is_footer(ln.text):
+            end = ln.top
+            break
+        if ln.top - last_bottom > CLUSTER_GAP_RATIO * body_h * 1.5:
+            end = ln.top          # a page gap: the header card has ended
+            break
+        last_bottom = max(last_bottom, ln.bottom)
+    if end is None:
+        end = last_bottom + 1
+    return HeaderSpan(title.top, title.left, end)
+
+
+def _header_blocks(lines: list[Line], header: HeaderSpan, body_h: int, keep_promo: bool) -> list[Block]:
+    """Title + subtitle blocks from the lines inside the header span."""
+    header_lines = [ln for ln in lines if header.title_top - body_h * 0.5 <= ln.top < header.end]
+    if not keep_promo:
+        header_lines = [ln for ln in header_lines if not is_promo(ln.text)]
+    header_lines = [ln for ln in header_lines
+                    if len(_norm(ln.text)) >= 2 and _norm(ln.text) not in _HEADER_JUNK_LINES]
+    if not header_lines:
+        return []
+
+    # Re-pick the title among the (now icon-stripped) header lines.
+    cands = []
+    for ln in header_lines:
+        seg = _name_segment(ln, body_h)
+        if seg is not None and seg.height >= NAME_MIN_RATIO * body_h:
+            cands.append((ln, seg))
+    if not cands:
+        return []
+    title_line, title_seg = max(cands, key=lambda p: _name_score(p[1]) + (-p[1].top,))
+    title = _strip_leading_junk(title_seg.text)
+    blocks = [Block("title", title)]
+    # A long name wraps its trailing credential onto the next line
+    # ("... MD FCAAAI," / "FCAAI"): fold it back into the title.
+    wrapped = next((ln for ln in header_lines if ln.top > title_line.top), None)
+    if (title.endswith(",") and wrapped is not None
+            and wrapped.top - title_line.bottom < body_h
+            and len(wrapped.text.split()) <= 2
+            and wrapped.text.replace(",", "").isupper()):
+        title = f"{title} {wrapped.text}"
+        blocks[0].text = title
+        header_lines = [ln for ln in header_lines if ln is not wrapped]
+    # Everything in the header is aligned with the name; a segment sitting
+    # left of it is the avatar's alt-text or an icon.
+    col_left = title_seg.left - 1.5 * body_h
+
+    subtitles: list[str] = []
+    for ln in header_lines:
+        if ln is title_line:
+            continue
+        # Filter word by word: an avatar box can OCR as one wide token that
+        # closes the gap to the real text, so segments alone are not enough.
+        kept = [w["text"] for w in sorted(ln.words, key=lambda w: w["left"])
+                if w["left"] >= col_left]
+        if not kept:
+            continue
+        sub = _strip_name_credential_prefix(_strip_leading_junk(clean_text(" ".join(kept))), title)
+        if _OCR_SYMBOL_RE.search(sub):
+            continue  # OCR noise from a broken avatar/icon image, not real text
+        if len(_norm(sub)) > 3 and not _subtitle_is_redundant(sub, subtitles):
+            blocks.append(Block("subtitle", sub))
+            subtitles.append(sub)
+    return blocks
+
+
+def _cluster_lines(lines: list[Line], body_h: int) -> list[list[Line]]:
+    """Group consecutive lines into visual clusters (cards / paragraphs)
+    separated by a gap much larger than the line spacing."""
+    clusters: list[list[Line]] = []
+    for ln in lines:
+        if clusters and ln.top - clusters[-1][-1].bottom <= CLUSTER_GAP_RATIO * body_h:
+            clusters[-1].append(ln)
+        else:
+            clusters.append([ln])
+    return clusters
+
+
+def _drop_promo_clusters(lines: list[Line], body_h: int) -> list[Line]:
+    """Remove the join/promo box as a whole: a cluster where at least half the
+    lines are promo copy is site chrome, including its wrapped continuation
+    lines that no keyword matches."""
+    kept: list[Line] = []
+    for cluster in _cluster_lines(lines, body_h):
+        promo = sum(1 for ln in cluster if is_promo(ln.text))
+        if promo and promo * 2 >= len(cluster):
+            continue
+        kept.extend(ln for ln in cluster if not is_promo(ln.text))
+    return kept
+
+
+def _strip_glued_icon(text: str) -> str:
+    """Drop a 1-3 character run containing an OCR symbol that is glued to the
+    front of a capitalised word (an entry's logo read as "l#Vanderbilt")."""
+    return re.sub(r"^\S{0,2}[#~=^`{}<>\|*§](?=[A-Z])", "", text)
+
+
+def _strip_citation_badge(text: str) -> str:
+    """Drop the small citation-count badge that trails a publication title
+    when OCR reads it as loose digits ("... Patients 5 28")."""
+    if len(text.split()) >= 5:
+        return re.sub(r"(?:\s+\d{1,3}[^\w\s]?)+$", "", text)
+    return text
+
+
+def _is_heading_shaped(text: str) -> bool:
+    n = _norm(text)
+    if not n or len(n.split()) > 6 or re.search(r"\d", text):
+        return False
+    if "," in text or text.rstrip().endswith((".", ":", ";")):
+        return False
+    if not re.match(r"[A-Z]", text.lstrip()):
+        return False
+    return not _looks_like_name(text)
+
+
+def _is_subheading_shaped(text: str) -> bool:
+    if match_subheading(text):
+        return True
+    n = _norm(text)
+    words = text.split()
+    if not n or len(words) > 4 or re.search(r"[\d,.:;]", text):
+        return False
+    return all(re.match(r"[A-Z(]", w) or w in ("&", "and", "of") for w in words)
+
+
+def classify_heading(ln: Line, prev_gap: float | None, next_gap: float | None,
+                     body_h: int, col_left: int) -> str | None:
+    """Return the canonical heading text if this line is a section heading.
+
+    A known heading name only needs body-size text. An unknown heading must
+    look like one typographically: a step larger than body text, at the
+    section column's left edge, short, and set off by whitespace above and
+    below (an entry title is the same size but its detail line hugs it).
+    """
+    known = match_heading(ln.text)
+    if known and ln.height >= body_h * 0.9:
+        return known
+    if match_subheading(ln.text) or ln.height < HEADING_MIN_RATIO * body_h:
+        return None
+    if _norm(ln.text) in _HEADER_JUNK_LINES or is_promo(ln.text):
+        return None
+    if ln.left > col_left + 2 * body_h:
+        return None
+    if not _is_heading_shaped(ln.text):
+        return None
+    gap_needed = SECTION_GAP_RATIO * body_h
+    above_ok = prev_gap is None or prev_gap >= gap_needed
+    below_ok = next_gap is None or next_gap >= gap_needed
+    if above_ok and below_ok:
+        return _title_case_if_all_caps(ln.text)
+    return None
+
+
+def build_blocks(lines: list[Line], header: HeaderSpan | None, keep_promo: bool,
+                 body_h: int | None = None) -> list[Block]:
     """Turn classified lines into ordered rendering blocks."""
     if not lines:
         return []
-
-    body = [ln for ln in lines if ln.bottom > header_end]
-    body_height = int(np.median([ln.height for ln in body])) if body else 12
+    if body_h is None:
+        body_h = body_glyph_height(lines)
 
     blocks: list[Block] = []
+    if header is not None:
+        blocks.extend(_header_blocks(lines, header, body_h, keep_promo))
+        body = [ln for ln in lines if ln.top >= header.end]
+    else:
+        body = list(lines)
 
-    # --- Header: title + subtitle lines (everything above the body region) ---
-    header_lines = [ln for ln in lines if ln.top < header_end]
-    if not keep_promo:
-        header_lines = [ln for ln in header_lines if not is_promo(ln.text)]
-    header_lines = [ln for ln in header_lines if len(_norm(ln.text)) >= 2]
-    header_lines = [ln for ln in header_lines if _norm(ln.text) not in _HEADER_JUNK_LINES]
-    if header_lines:
-        # The name is the header line that carries a degree credential near its
-        # end ("... MD"); this beats "tallest", which can pick a stray logo glyph
-        # (e.g. "ov", "“Aoximity") or a "MD at <employer>" line. Fall back to the
-        # tallest line only if no credentialed name line is present.
-        name_lines = [ln for ln in header_lines if _looks_like_name(ln.text)]
-        if name_lines:
-            title_line = max(name_lines, key=lambda ln: (ln.height, len(ln.text)))
-        else:
-            title_line = max(header_lines, key=lambda ln: ln.height)
-        title = _strip_leading_junk(title_line.text)
-        blocks.append(Block("title", title))
-        subtitles: list[str] = []
-        for ln in header_lines:
-            if ln is title_line:
-                continue
-            sub = _strip_name_credential_prefix(_strip_leading_junk(ln.text), title)
-            if re.search(r"[@{}<>~^`\\=]", sub):
-                continue  # OCR noise from a broken avatar/icon image, not real text
-            if len(_norm(sub)) > 3 and not _subtitle_is_redundant(sub, subtitles):
-                blocks.append(Block("subtitle", sub))
-                subtitles.append(sub)
+    # Cut at the site footer; drop the promo/join box as a spatial unit.
+    trimmed: list[Line] = []
+    for ln in body:
+        if not keep_promo and is_footer(ln.text):
+            break
+        trimmed.append(ln)
+    body = trimmed if keep_promo else _drop_promo_clusters(trimmed, body_h)
+    if not body:
+        return blocks
 
-    # --- Body: sections, sub-headings, and gap-separated entries -------------
+    col_left = int(min(ln.left for ln in body))
     seen_heading = False
     pending: list[Line] = []          # lines accumulating into the current entry group
 
@@ -617,17 +959,14 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
         """Split a run of body lines into entries by vertical spacing."""
         if not group:
             return
-        gaps = [
-            group[i].top - group[i - 1].bottom for i in range(1, len(group))
-        ]
+        gaps = [group[i].top - group[i - 1].bottom for i in range(1, len(group))]
         # An "entry break" is a gap noticeably larger than the typical line gap.
         typical = np.median(gaps) if gaps else 0
-        threshold = max(typical * 1.8, body_height * 0.9)
+        threshold = max(typical * 1.8, body_h * 0.9)
 
         entry: list[Line] = [group[0]]
         for i in range(1, len(group)):
-            gap = group[i].top - group[i - 1].bottom
-            if gap > threshold:
+            if group[i].top - group[i - 1].bottom > threshold:
                 _emit_entry(entry)
                 entry = [group[i]]
             else:
@@ -637,8 +976,8 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
     def _emit_entry(entry: list[Line]):
         if not entry:
             return
-        head = entry[0].text
-        details = [ln.text for ln in entry[1:]]
+        head = _strip_citation_badge(_strip_glued_icon(entry[0].text))
+        details = [_strip_glued_icon(ln.text) for ln in entry[1:]]
         if details:
             head_norm = _norm(head)
             first_detail_norm = _norm(details[0])
@@ -648,6 +987,14 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
                 # the redundant repeat rather than showing it twice.
                 details.pop(0)
             elif (
+                first_detail_norm
+                and head_norm.endswith(first_detail_norm)
+                and len(head_norm) - len(first_detail_norm) <= 4
+            ):
+                # Same repeat, but the alt-text copy has the logo glued to its
+                # front ("leiVanderbilt University"): keep the clean copy.
+                head = details.pop(0)
+            elif (
                 head_norm
                 and len(first_detail_norm) > len(head_norm)
                 and head_norm in first_detail_norm
@@ -655,14 +1002,12 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
                 head = details.pop(0)
         blocks.append(Block("entry", head, details))
 
-    for ln in body:
-        if not keep_promo and is_footer(ln.text):
-            break  # site footer / SEO block — nothing real comes after it
-        if not keep_promo and is_promo(ln.text):
-            continue
+    for i, ln in enumerate(body):
+        prev_gap = ln.top - body[i - 1].bottom if i > 0 else None
+        next_gap = body[i + 1].top - ln.bottom if i + 1 < len(body) else None
 
-        heading = match_heading(ln.text)
-        if heading and ln.height >= body_height * 0.9:
+        heading = classify_heading(ln, prev_gap, next_gap, body_h, col_left)
+        if heading:
             flush_entries(pending)
             pending = []
             blocks.append(Block("heading", heading))
@@ -677,15 +1022,22 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
             continue
 
         if not seen_heading:
-            # Everything before the first section heading is Doximity's join /
-            # promo box (the physician's data starts at the first heading).
-            if keep_promo:
-                blocks.append(Block("body", ln.text))
+            # Free text above the first section (a bio / summary paragraph).
+            flush_entries(pending)
+            pending = []
+            blocks.append(Block("body", ln.text))
             continue
 
         pending.append(ln)
 
     flush_entries(pending)
+
+    # A detail-less, title-cased entry that introduces further entries is a
+    # sub-heading inside the section ("Journal Articles", "Lectures").
+    for i, b in enumerate(blocks[:-1]):
+        if (b.kind == "entry" and not b.details and blocks[i + 1].kind == "entry"
+                and _is_subheading_shaped(b.text)):
+            b.kind = "subheading"
     return blocks
 
 
@@ -1612,7 +1964,10 @@ def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Blo
             (side.width * SIDEBAR_UPSCALE, side.height * SIDEBAR_UPSCALE),
             Image.LANCZOS,
         )
-    words = ocr_words(side, psm=4, min_conf=min(min_conf, 10))
+    # Tesseract's confidence is unreliable on this small type (a correctly
+    # read street line can score 3), and the parser below is shape-driven,
+    # so take every token and let structure do the filtering.
+    words = ocr_words(side, psm=4, min_conf=0)
     lines = group_lines(words, 0)
 
     address_lines: list[str] = []
@@ -1666,33 +2021,35 @@ def _analyze_image(
     image_source: Path | str | bytes | bytearray,
     *,
     source_name: str,
-    scale: float = 1.5,
-    cutoff_ratio: float = 0.66,
+    scale: float | None = None,
+    cutoff_ratio: float | None = None,   # kept for callers; no longer used
     keep_promo: bool = False,
     min_conf: int = 35,
     debug: bool = False,
 ) -> list[Block]:
     img = load_image(image_source, scale)
-    img, header_end = deinvert_dark_header(img)
+    img, band_end = deinvert_dark_header(img)
 
-    # First pass on the full image to locate the column divider.
+    # First pass on the full image to locate the column divider (if any).
     full_words = ocr_words(img, psm=3, min_conf=35)
-    cutoff = find_column_cutoff(full_words, img.width, header_end, cutoff_ratio)
+    cutoff = find_column_cutoff(full_words, img.width, img.height)
 
-    # Crop to the main column and OCR as a single column. The confidence floor is
-    # kept moderate: the entry logos OCR into low-confidence junk that is normal
+    # OCR the main column as a single column. The confidence floor is kept
+    # moderate: the entry logos OCR into low-confidence junk that is normal
     # height and tight to the text, so it can't be cleaned up downstream.
     main = img.crop((0, 0, cutoff, img.height))
-    words = ocr_words(main, psm=4, min_conf=min_conf)
-    lines = group_lines(words, header_end)
+    words = keep_confident_or_large(ocr_words(main, psm=4, min_conf=0), min_conf)
 
-    # Pages with no dark header band (header_end == 0) would otherwise have
-    # their name/specialty/location lines misread as pre-heading promo text
-    # and dropped; infer the header/body boundary from content instead.
-    effective_header_end = header_end if header_end > 0 else infer_header_end(lines)
-    blocks = build_blocks(lines, effective_header_end, keep_promo)
+    # Locate the header on un-stripped lines (the name's first word is short
+    # and tall, exactly what the icon stripper removes in the body), then
+    # regroup with icon stripping switched off inside that span.
+    raw_lines = group_lines(words, header_end=img.height)
+    body_h = body_glyph_height(raw_lines)
+    header = locate_header(raw_lines, img.height, body_h)
+    lines = group_lines(words, header_end=header.end if header else band_end)
+    blocks = build_blocks(lines, header, keep_promo, body_h)
 
-    if not keep_promo:
+    if not keep_promo and cutoff < img.width:
         contact = _extract_contact_card(img, cutoff, min_conf)
         if contact is not None:
             insert_at = next(
@@ -1702,9 +2059,10 @@ def _analyze_image(
             blocks[insert_at:insert_at] = [Block("heading", "Practice Address"), contact]
 
     if debug:
+        hdr = f"{header.title_top}-{header.end}" if header else "none"
         print(f"\n=== {source_name} ===")
-        print(f"header_end={header_end} (effective={effective_header_end})  cutoff={cutoff}/{img.width}  "
-              f"lines={len(lines)} blocks={len(blocks)}")
+        print(f"size={img.width}x{img.height} band={band_end} header={hdr} "
+              f"cutoff={cutoff}/{img.width} body_h={body_h} lines={len(lines)} blocks={len(blocks)}")
         for b in blocks:
             print(f"  [{b.kind:10}] {b.text[:70]}")
             for d in b.details:
@@ -1712,12 +2070,13 @@ def _analyze_image(
 
     return blocks
 
+
 def convert(
     image_path: Path,
     out_path: Path,
     *,
-    scale: float = 1.5,
-    cutoff_ratio: float = 0.66,
+    scale: float | None = None,
+    cutoff_ratio: float | None = None,
     keep_promo: bool = False,
     min_conf: int = 35,
     debug: bool = False,
@@ -1742,8 +2101,8 @@ def convert_bytes(
     image_bytes: bytes,
     source_name: str,
     *,
-    scale: float = 1.5,
-    cutoff_ratio: float = 0.66,
+    scale: float | None = None,
+    cutoff_ratio: float | None = None,
     keep_promo: bool = False,
     min_conf: int = 35,
     debug: bool = False,
@@ -1787,10 +2146,11 @@ def main(argv: list[str] | None = None) -> int:
                          "batches/Excel, or local staging folder with "
                          "--onedrive-upload")
     ap.add_argument("--tesseract", help="Path to tesseract.exe")
-    ap.add_argument("--scale", type=float, default=1.5,
-                    help="Upscale factor before OCR (default 1.5)")
-    ap.add_argument("--cutoff-ratio", type=float, default=0.66,
-                    help="Fallback main-column width fraction (default 0.66)")
+    ap.add_argument("--scale", type=float, default=None,
+                    help="Upscale factor before OCR (default: chosen from the "
+                         "image width so any resolution OCRs at the same glyph size)")
+    ap.add_argument("--cutoff-ratio", type=float, default=None,
+                    help=argparse.SUPPRESS)   # legacy; the sidebar is now detected, never assumed
     ap.add_argument("--min-conf", type=int, default=35,
                     help="Min OCR confidence for body text (default 35; lower "
                          "toward 0 for max recall, but expect icon/seal noise)")
