@@ -459,8 +459,8 @@ def is_footer(text: str) -> bool:
     return text.count("Dr.") >= 3
 
 
-_NAME_CRED = re.compile(r"\b(MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD)\b")
-_HEADER_CRED = re.compile(r"\b(MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD|MBA|MPH|MSc|MS|PhD)\b", re.I)
+_NAME_CRED = re.compile(r"\b(MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD|NP|PA|DNP|FNP|CRNA|CNM|RN)\b")
+_HEADER_CRED = re.compile(r"\b(MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD|MBA|MPH|MSc|MS|PhD|NP|PA|DNP|FNP|CRNA|CNM|RN)\b", re.I)
 
 
 def _looks_like_name(text: str) -> bool:
@@ -500,12 +500,15 @@ def _strip_name_credential_prefix(text: str, title: str) -> str:
         escaped_names.append(re.escape(f"{words[0]} {words[-1]}"))
     name_alt = "|".join(escaped_names)
     cred = r"(?:MD|DO|MBBS|MBChB|DDS|DMD|DPM|DPT|DC|ND|PharmD|MBA|MPH|MSc|MS|PhD)"
-    return re.sub(
+    text = re.sub(
         rf"^\s*(?:{name_alt})\s*,\s*(?:{cred}\s*,\s*)+",
         "",
         text,
         flags=re.I,
     ).strip()
+    # A bare last-name echo with no credential (e.g. a broken avatar's alt text
+    # sharing a text row with the real subtitle: "Smith, Women's Health ...").
+    return re.sub(rf"^\s*(?:{name_alt})\s*,\s*", "", text, count=1, flags=re.I).strip()
 
 
 def _subtitle_is_redundant(text: str, existing: list[str]) -> bool:
@@ -544,6 +547,29 @@ def match_subheading(text: str) -> str | None:
     return None
 
 
+# Trigger phrases that mark the *start* of Doximity's join/promo box, used to
+# find the header/body boundary on light-header profile pages where there is
+# no dark band to de-invert. The bare "oximity" brand-name snippet is excluded
+# because it also matches the logo line sitting above the real name/subtitle.
+_HEADER_END_TRIGGERS = [_norm(p) for p in PROMO_SNIPPETS if p != "oximity"]
+
+# Bare alt-text/logo artifacts that sometimes OCR as their own short header
+# line (e.g. a broken "Doximity Logo" image); never real name/specialty text.
+_HEADER_JUNK_LINES = {"logo", "doximity logo"}
+
+
+def infer_header_end(lines: list[Line]) -> int:
+    """Find where the header (name/specialty/location) ends on pages with no
+    dark header band, by locating the first join/promo-box line."""
+    for ln in lines:
+        n = _norm(ln.text)
+        if not n:
+            continue
+        if any(trigger in n for trigger in _HEADER_END_TRIGGERS) or match_heading(ln.text):
+            return ln.top
+    return 0
+
+
 def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[Block]:
     """Turn classified lines into ordered rendering blocks."""
     if not lines:
@@ -559,6 +585,7 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
     if not keep_promo:
         header_lines = [ln for ln in header_lines if not is_promo(ln.text)]
     header_lines = [ln for ln in header_lines if len(_norm(ln.text)) >= 2]
+    header_lines = [ln for ln in header_lines if _norm(ln.text) not in _HEADER_JUNK_LINES]
     if header_lines:
         # The name is the header line that carries a degree credential near its
         # end ("... MD"); this beats "tallest", which can pick a stray logo glyph
@@ -576,6 +603,8 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
             if ln is title_line:
                 continue
             sub = _strip_name_credential_prefix(_strip_leading_junk(ln.text), title)
+            if re.search(r"[@{}<>~^`\\=]", sub):
+                continue  # OCR noise from a broken avatar/icon image, not real text
             if len(_norm(sub)) > 3 and not _subtitle_is_redundant(sub, subtitles):
                 blocks.append(Block("subtitle", sub))
                 subtitles.append(sub)
@@ -1539,6 +1568,66 @@ def convert_tabular(
 # Orchestration
 # --------------------------------------------------------------------------- #
 
+_LABEL_PHONE_RE = re.compile(r"\bphone\b")
+_LABEL_FAX_RE = re.compile(r"\bfax\b")
+
+
+def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Block | None:
+    """Pull the practice-address / phone / fax card out of the right sidebar.
+
+    The sidebar is cropped away before the main OCR pass (it's mostly the
+    "Similar Physicians" list and join/promo chrome), but its contact card at
+    the top carries real data that belongs in the document. This does a
+    second, low-confidence OCR pass over just that region and stops at the
+    first "Similar ..." list heading or promo line.
+    """
+    if cutoff >= img.width - 5:
+        return None
+    side = img.crop((cutoff, 0, img.width, img.height))
+    words = ocr_words(side, psm=4, min_conf=min(min_conf, 10))
+    lines = group_lines(words, 0)
+
+    address_lines: list[str] = []
+    phone = fax = None
+    stage = None  # None | "phone" | "fax"
+    for ln in lines:
+        text = clean_text(ln.text)
+        norm = _norm(text)
+        if not norm or len(norm) < 2:
+            continue
+        if norm.startswith("similar") or is_footer(text):
+            break
+        if is_promo(text):
+            continue  # e.g. the "Join to view full profile" button
+        if stage == "phone":
+            phone = text
+            stage = None
+            continue
+        if stage == "fax":
+            fax = text
+            stage = None
+            continue
+        if len(norm) <= 10 and _LABEL_PHONE_RE.search(norm):
+            stage = "phone"
+            continue
+        if len(norm) <= 10 and _LABEL_FAX_RE.search(norm):
+            stage = "fax"
+            continue
+        if re.search(r"[A-Za-z0-9]", text):
+            address_lines.append(text)
+
+    if not address_lines and not phone and not fax:
+        return None
+
+    head = address_lines[0] if address_lines else "Practice Address"
+    details = (address_lines[1:] if address_lines else [])
+    if phone:
+        details.append(f"Phone: {phone}")
+    if fax:
+        details.append(f"Fax: {fax}")
+    return Block("entry", head, details)
+
+
 def _analyze_image(
     image_source: Path | str | bytes | bytearray,
     *,
@@ -1562,11 +1651,25 @@ def _analyze_image(
     main = img.crop((0, 0, cutoff, img.height))
     words = ocr_words(main, psm=4, min_conf=min_conf)
     lines = group_lines(words, header_end)
-    blocks = build_blocks(lines, header_end, keep_promo)
+
+    # Pages with no dark header band (header_end == 0) would otherwise have
+    # their name/specialty/location lines misread as pre-heading promo text
+    # and dropped; infer the header/body boundary from content instead.
+    effective_header_end = header_end if header_end > 0 else infer_header_end(lines)
+    blocks = build_blocks(lines, effective_header_end, keep_promo)
+
+    if not keep_promo:
+        contact = _extract_contact_card(img, cutoff, min_conf)
+        if contact is not None:
+            insert_at = next(
+                (i for i, b in enumerate(blocks) if b.kind not in ("title", "subtitle")),
+                len(blocks),
+            )
+            blocks[insert_at:insert_at] = [Block("heading", "Practice Address"), contact]
 
     if debug:
         print(f"\n=== {source_name} ===")
-        print(f"header_end={header_end}  cutoff={cutoff}/{img.width}  "
+        print(f"header_end={header_end} (effective={effective_header_end})  cutoff={cutoff}/{img.width}  "
               f"lines={len(lines)} blocks={len(blocks)}")
         for b in blocks:
             print(f"  [{b.kind:10}] {b.text[:70]}")
