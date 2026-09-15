@@ -1575,6 +1575,14 @@ def convert_tabular(
 
 _LABEL_PHONE_RE = re.compile(r"\bphone\b")
 _LABEL_FAX_RE = re.compile(r"\bfax\b")
+# A contact value is a phone number: optional country code plus 7+ digits.
+_PHONE_VALUE_RE = re.compile(r"^\+?[\d(][\d\s().+-]{6,}$")
+
+# The sidebar renders its contact card in a small font. OCR at the page scale
+# mis-reads it ("St" -> "Sst") and hands the phone numbers a near-zero
+# confidence that the confidence floor then drops, silently losing the phone.
+# Re-scaling the crop before the second pass restores both.
+SIDEBAR_UPSCALE = 2
 
 
 def _strip_leading_icon_glyph(text: str) -> str:
@@ -1599,6 +1607,11 @@ def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Blo
     if cutoff >= img.width - 5:
         return None
     side = img.crop((cutoff, 0, img.width, img.height))
+    if SIDEBAR_UPSCALE > 1:
+        side = side.resize(
+            (side.width * SIDEBAR_UPSCALE, side.height * SIDEBAR_UPSCALE),
+            Image.LANCZOS,
+        )
     words = ocr_words(side, psm=4, min_conf=min(min_conf, 10))
     lines = group_lines(words, 0)
 
@@ -1623,14 +1636,17 @@ def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Blo
         if len(norm) <= 10 and _LABEL_FAX_RE.search(norm):
             stage = "fax"
             continue
-        if stage == "phone":
-            phone = text
-            stage = None
-            continue
-        if stage == "fax":
-            fax = text
-            stage = None
-            continue
+        # Only a phone-shaped line may be consumed as the pending value. If OCR
+        # lost the number entirely, the next line is real address or section
+        # text and must not be mislabelled as the phone or fax.
+        if stage is not None:
+            stage_was, stage = stage, None
+            if _PHONE_VALUE_RE.match(text):
+                if stage_was == "phone":
+                    phone = text
+                else:
+                    fax = text
+                continue
         if re.search(r"[A-Za-z0-9]", text):
             address_lines.append(_strip_leading_icon_glyph(text))
 
