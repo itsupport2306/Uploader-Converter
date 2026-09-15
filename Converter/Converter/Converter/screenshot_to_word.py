@@ -642,7 +642,12 @@ def build_blocks(lines: list[Line], header_end: int, keep_promo: bool) -> list[B
         if details:
             head_norm = _norm(head)
             first_detail_norm = _norm(details[0])
-            if (
+            if head_norm and head_norm == first_detail_norm:
+                # An institution's alt-text image and its bold heading OCR to
+                # the exact same line (e.g. "Bryn Mawr College" twice) — drop
+                # the redundant repeat rather than showing it twice.
+                details.pop(0)
+            elif (
                 head_norm
                 and len(first_detail_norm) > len(head_norm)
                 and head_norm in first_detail_norm
@@ -1572,6 +1577,16 @@ _LABEL_PHONE_RE = re.compile(r"\bphone\b")
 _LABEL_FAX_RE = re.compile(r"\bfax\b")
 
 
+def _strip_leading_icon_glyph(text: str) -> str:
+    """Drop a stray single-letter/symbol OCR artifact from a sidebar icon
+    (map pin, phone, fax) glued to the front of the real text, e.g.
+    "Q 1108 16th St NW" -> "1108 16th St NW"."""
+    m = re.match(r"^[A-Za-z]\s+(?=\d)", text)
+    if m:
+        return text[m.end():]
+    return re.sub(r"^[^\w\s]+\s*", "", text)
+
+
 def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Block | None:
     """Pull the practice-address / phone / fax card out of the right sidebar.
 
@@ -1599,6 +1614,15 @@ def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Blo
             break
         if is_promo(text):
             continue  # e.g. the "Join to view full profile" button
+        # Check for a Phone/Fax label before consuming a pending value: if OCR
+        # dropped a value line entirely (common for the faint contact icons),
+        # the next line is the following label, not the missing value.
+        if len(norm) <= 10 and _LABEL_PHONE_RE.search(norm):
+            stage = "phone"
+            continue
+        if len(norm) <= 10 and _LABEL_FAX_RE.search(norm):
+            stage = "fax"
+            continue
         if stage == "phone":
             phone = text
             stage = None
@@ -1607,14 +1631,8 @@ def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Blo
             fax = text
             stage = None
             continue
-        if len(norm) <= 10 and _LABEL_PHONE_RE.search(norm):
-            stage = "phone"
-            continue
-        if len(norm) <= 10 and _LABEL_FAX_RE.search(norm):
-            stage = "fax"
-            continue
         if re.search(r"[A-Za-z0-9]", text):
-            address_lines.append(text)
+            address_lines.append(_strip_leading_icon_glyph(text))
 
     if not address_lines and not phone and not fax:
         return None
