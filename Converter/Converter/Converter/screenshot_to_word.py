@@ -57,6 +57,14 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 
+# The person-name detector is shared with the uploader so both sides judge a
+# name by the same rules. It lives at the repository root.
+try:
+    import profile_name
+except ImportError:  # run from inside the Converter folder
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    import profile_name
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -69,6 +77,12 @@ TESSERACT_CANDIDATES = [
 ]
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+# Stamped into every generated DOCX (core properties). The uploader compares
+# it against its own copy so a DOCX written by an older converter is rebuilt
+# instead of being re-parsed forever.
+CONVERTER_VERSION = "2026.09.15.1"
+DOCX_META_TAG = "screenshot_to_word"
 EXCEL_EXTS = {".xlsx", ".xlsm"}
 CSV_EXTS = {".csv"}
 TABULAR_EXTS = EXCEL_EXTS | CSV_EXTS
@@ -219,6 +233,23 @@ class Block:
     kind: str            # title | subtitle | heading | subheading | entry | body
     text: str
     details: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AnalysisResult:
+    """Everything the image analysis learned: the rendering blocks plus the
+    person-name detection (with confidence and evidence) and the metadata
+    that gets written into the DOCX so downstream stages need not re-guess."""
+    blocks: list[Block]
+    name: "profile_name.NameDetection"
+
+    @property
+    def meta(self) -> dict:
+        return {
+            "tag": DOCX_META_TAG,
+            "converter_version": CONVERTER_VERSION,
+            "name": self.name.to_dict(),
+        }
 
 
 @dataclass
@@ -1069,8 +1100,39 @@ def _add_bottom_border(paragraph):
     pPr.append(borders)
 
 
-def _build_document(blocks: list[Block]) -> Document:
+def _apply_docx_meta(doc: Document, meta: dict | None) -> None:
+    """Record the detected name and converter version in the core properties.
+    The uploader reads these back, so the name found from layout evidence is
+    not lost when the document is flattened to text again."""
+    if not meta:
+        return
+    props = doc.core_properties
+    name = dict(meta.get("name") or {})
+    props.title = (name.get("display") or "")[:255]
+    props.subject = "Profile"
+    props.category = f"{DOCX_META_TAG} {meta.get('converter_version', '')}".strip()
+    # Core properties are capped at 255 characters each, so the detection is
+    # stored compactly; the full evidence trail goes to the run log instead.
+    compact = {
+        "tag": DOCX_META_TAG,
+        "v": meta.get("converter_version"),
+        "first": name.get("first"),
+        "last": name.get("last"),
+        "display": name.get("display"),
+        "confidence": name.get("confidence"),
+        "method": name.get("method"),
+        "needs_review": name.get("needs_review", True),
+    }
+    props.comments = json.dumps(compact, ensure_ascii=False)[:255]
+    evidence = " | ".join(name.get("evidence") or [])
+    if name.get("reason"):
+        evidence = f"{name['reason']} | {evidence}"
+    props.keywords = evidence[:255]
+
+
+def _build_document(blocks: list[Block], meta: dict | None = None) -> Document:
     doc = Document()
+    _apply_docx_meta(doc, meta)
 
     # Base style.
     normal = doc.styles["Normal"]
@@ -1119,13 +1181,13 @@ def _build_document(blocks: list[Block]) -> Document:
     return doc
 
 
-def render_docx(blocks: list[Block], out_path: Path) -> None:
-    doc = _build_document(blocks)
+def render_docx(blocks: list[Block], out_path: Path, meta: dict | None = None) -> None:
+    doc = _build_document(blocks, meta)
     doc.save(str(out_path))
 
 
-def render_docx_bytes(blocks: list[Block]) -> bytes:
-    doc = _build_document(blocks)
+def render_docx_bytes(blocks: list[Block], meta: dict | None = None) -> bytes:
+    doc = _build_document(blocks, meta)
     buffer = io.BytesIO()
     doc.save(buffer)
     return buffer.getvalue()
@@ -1572,9 +1634,9 @@ def save_resume_row(state_path: Path, input_path: Path, next_row: int) -> None:
     os.replace(tmp_path, state_path)
 
 
-def _write_docx_atomic(blocks: list[Block], out_path: Path) -> None:
+def _write_docx_atomic(blocks: list[Block], out_path: Path, meta: dict | None = None) -> None:
     tmp_path = out_path.parent / (out_path.name + ".tmp")
-    render_docx(blocks, tmp_path)
+    render_docx(blocks, tmp_path, meta)
     os.replace(tmp_path, out_path)
 
 
@@ -2017,6 +2079,57 @@ def _extract_contact_card(img: "Image.Image", cutoff: int, min_conf: int) -> Blo
     return Block("entry", head, details)
 
 
+def detect_person_name(
+    blocks: list[Block],
+    lines: list[Line],
+    source_name: str,
+    header: HeaderSpan | None,
+    body_h: int,
+) -> "profile_name.NameDetection":
+    """Cross-check every independent read of the person's name on the page.
+
+    Sources, strongest first: the layout title (largest text in the top half,
+    usually with a credential), the page's own copy that repeats the name
+    ("<Name> is on Doximity", "See <Name>'s full profile"), and the source
+    filename. Each is validated for the shape of a person's name and scored by
+    agreement, so a lost or garbled title line degrades to a lower confidence
+    (or a review flag) instead of letting the next big line stand in for it.
+    """
+    cands: list[profile_name.NameCandidate] = []
+    title = next((b for b in blocks if b.kind == "title"), None)
+    if title is not None:
+        c = profile_name.NameCandidate("layout", title.text, 0.6)
+        if header is not None and c.valid:
+            ratio = max((ln.height for ln in lines if ln.top == header.title_top), default=0) / max(1, body_h)
+            c.reason = f"largest text in top half (x{ratio:.1f} body size)"
+        cands.append(c)
+    for text in profile_name.page_text_names(ln.text for ln in lines):
+        cands.append(profile_name.NameCandidate("page_text", text, 0.5))
+    fname = profile_name.name_from_source_name(source_name)
+    if fname:
+        cands.append(profile_name.NameCandidate("filename", " ".join(fname), 0.3))
+    else:
+        cands.append(profile_name.NameCandidate("filename", Path(source_name).stem, 0.0))
+    return profile_name.detect_name(cands)
+
+
+def _reconcile_title(blocks: list[Block], name: "profile_name.NameDetection") -> list[Block]:
+    """Make the rendered title agree with the validated name detection.
+
+    If layout found no title (or picked a line that is not a person's name)
+    but the page copy / filename identified the person, put that name at the
+    top so the DOCX is complete. A layout title that passed validation is
+    left exactly as OCR read it (credentials included)."""
+    if not name.display or name.needs_review:
+        return blocks
+    title = next((b for b in blocks if b.kind == "title"), None)
+    if title is None:
+        return [Block("title", name.display)] + blocks
+    if not profile_name.NameCandidate("layout", title.text, 0.0).valid:
+        title.text = name.display
+    return blocks
+
+
 def _analyze_image(
     image_source: Path | str | bytes | bytearray,
     *,
@@ -2026,7 +2139,7 @@ def _analyze_image(
     keep_promo: bool = False,
     min_conf: int = 35,
     debug: bool = False,
-) -> list[Block]:
+) -> AnalysisResult:
     img = load_image(image_source, scale)
     img, band_end = deinvert_dark_header(img)
 
@@ -2049,6 +2162,11 @@ def _analyze_image(
     lines = group_lines(words, header_end=header.end if header else band_end)
     blocks = build_blocks(lines, header, keep_promo, body_h)
 
+    # Judge the name on all evidence (layout, page copy, filename) before the
+    # promo lines that repeat it are dropped from the rendered document.
+    name = detect_person_name(blocks, raw_lines, source_name, header, body_h)
+    blocks = _reconcile_title(blocks, name)
+
     if not keep_promo and cutoff < img.width:
         contact = _extract_contact_card(img, cutoff, min_conf)
         if contact is not None:
@@ -2063,12 +2181,41 @@ def _analyze_image(
         print(f"\n=== {source_name} ===")
         print(f"size={img.width}x{img.height} band={band_end} header={hdr} "
               f"cutoff={cutoff}/{img.width} body_h={body_h} lines={len(lines)} blocks={len(blocks)}")
+        print(f"name: {name.summary()}")
+        for line in name.evidence:
+            print(f"      {line}")
         for b in blocks:
             print(f"  [{b.kind:10}] {b.text[:70]}")
             for d in b.details:
                 print(f"               - {d[:66]}")
 
-    return blocks
+    return AnalysisResult(blocks, name)
+
+
+def convert_result(
+    image_path: Path,
+    out_path: Path,
+    *,
+    scale: float | None = None,
+    cutoff_ratio: float | None = None,
+    keep_promo: bool = False,
+    min_conf: int = 35,
+    debug: bool = False,
+) -> AnalysisResult:
+    result = _analyze_image(
+        image_path,
+        source_name=image_path.name,
+        scale=scale,
+        cutoff_ratio=cutoff_ratio,
+        keep_promo=keep_promo,
+        min_conf=min_conf,
+        debug=debug,
+    )
+
+    # Write to a temp file then atomically rename, so a run killed mid-write
+    # never leaves a partial .docx that a later resume would wrongly skip.
+    _write_docx_atomic(result.blocks, out_path, result.meta)
+    return result
 
 
 def convert(
@@ -2081,20 +2228,38 @@ def convert(
     min_conf: int = 35,
     debug: bool = False,
 ) -> Path:
-    blocks = _analyze_image(
+    convert_result(
         image_path,
-        source_name=image_path.name,
+        out_path,
         scale=scale,
         cutoff_ratio=cutoff_ratio,
         keep_promo=keep_promo,
         min_conf=min_conf,
         debug=debug,
     )
-
-    # Write to a temp file then atomically rename, so a run killed mid-write
-    # never leaves a partial .docx that a later resume would wrongly skip.
-    _write_docx_atomic(blocks, out_path)
     return out_path
+
+
+def convert_bytes_result(
+    image_bytes: bytes,
+    source_name: str,
+    *,
+    scale: float | None = None,
+    cutoff_ratio: float | None = None,
+    keep_promo: bool = False,
+    min_conf: int = 35,
+    debug: bool = False,
+) -> tuple[bytes, AnalysisResult]:
+    result = _analyze_image(
+        image_bytes,
+        source_name=source_name,
+        scale=scale,
+        cutoff_ratio=cutoff_ratio,
+        keep_promo=keep_promo,
+        min_conf=min_conf,
+        debug=debug,
+    )
+    return render_docx_bytes(result.blocks, result.meta), result
 
 
 def convert_bytes(
@@ -2107,16 +2272,16 @@ def convert_bytes(
     min_conf: int = 35,
     debug: bool = False,
 ) -> bytes:
-    blocks = _analyze_image(
+    data, _ = convert_bytes_result(
         image_bytes,
-        source_name=source_name,
+        source_name,
         scale=scale,
         cutoff_ratio=cutoff_ratio,
         keep_promo=keep_promo,
         min_conf=min_conf,
         debug=debug,
     )
-    return render_docx_bytes(blocks)
+    return data
 
 
 def iter_inputs(input_path: Path):

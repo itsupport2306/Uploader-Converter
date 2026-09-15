@@ -28,6 +28,7 @@ DEFAULT_OUTPUT_FOLDER_NAME = "generated_docx"
 DEFAULT_OUTPUT_PARENT_DIR = Path(r"C:\virinchi")
 DEFAULT_PROCESS_MANIFEST = ROOT / "complete_process_profiles_manifest.jsonl"
 DEFAULT_UPLOAD_LOG = ROOT / "complete_process_upload_log.csv"
+DEFAULT_REVIEW_LOG = ROOT / "complete_process_review.jsonl"
 DEFAULT_TARGET_TABLE = "profiles"
 DEFAULT_ENV_FILE = "env 1" if (ROOT / "env 1").exists() else ".env"
 DEFAULT_ONEDRIVE_TENANT = os.environ.get("ONEDRIVE_TENANT", "common")
@@ -115,6 +116,8 @@ def _load_module(name: str, path: Path):
 sys.path.insert(0, str(CONVERTER_DIR))
 converter = _load_module("screenshot_to_word", CONVERTER_DIR / "screenshot_to_word.py")
 uploader = _load_module("data_upload_5", UPLOAD_SCRIPT)
+# Lets the uploader recognise a DOCX written by an older converter.
+uploader.CONVERTER_VERSION_EXPECTED = converter.CONVERTER_VERSION
 
 
 IMAGE_EXTS = converter.IMAGE_EXTS
@@ -621,7 +624,7 @@ def _process_one(
         # inserting a duplicate.
         digest = uploader._sha256_bytes(image_bytes)
         print(f"Running OCR and DOCX conversion: {source.display_name}")
-        docx_bytes = converter.convert_bytes(
+        docx_bytes, _ = converter.convert_bytes_result(
             image_bytes,
             source.display_name,
             scale=args.scale,
@@ -630,7 +633,8 @@ def _process_one(
             min_conf=args.min_conf,
             debug=args.debug,
         )
-        text = uploader.extract_docx_text_bytes(docx_bytes)
+        docx_profile = uploader.extract_docx_profile_bytes(docx_bytes)
+        text = docx_profile.text
     else:
         if output_dir is None or source.local_path is None:
             raise RuntimeError("Local processing requires a concrete output directory and source path.")
@@ -639,7 +643,17 @@ def _process_one(
         # See the remote branch above: digest is taken from the source
         # screenshot (stable across reconversions), not the generated DOCX.
         digest = uploader._sha256_file(source.local_path)
-        if not docx_path.exists() or args.force_convert:
+        docx_profile = None
+        if docx_path.exists() and not args.force_convert:
+            docx_profile = uploader.extract_docx_profile(docx_path)
+            # A DOCX written by an older converter (or by hand) carries no
+            # name detection; re-running OCR is the only way to get one, so
+            # rebuild it rather than re-parsing the stale file forever.
+            if docx_profile.is_stale and not args.reuse_stale_docx:
+                print(f"Rebuilding stale DOCX (converter {docx_profile.converter_version or 'unknown'} -> "
+                      f"{converter.CONVERTER_VERSION}): {docx_path.name}")
+                docx_profile = None
+        if docx_profile is None:
             converter.convert(
                 source.local_path,
                 docx_path,
@@ -649,12 +663,32 @@ def _process_one(
                 min_conf=args.min_conf,
                 debug=args.debug,
             )
-        text = uploader.extract_text(docx_path)
+            docx_profile = uploader.extract_docx_profile(docx_path)
+        text = docx_profile.text
         docx_bytes = None
 
-    fields = uploader.parse_resume_smart(text, docx_parse_path)
+    fields = uploader.parse_resume_smart(text, docx_parse_path, docx_profile)
     label = f"{fields['first_name']} {fields['last_name']}"
     base["label"] = label
+    base.update({
+        "name_display": fields.get("name_display"),
+        "name_confidence": fields.get("name_confidence"),
+        "name_method": fields.get("name_method"),
+        "name_evidence": fields.get("name_evidence"),
+        "needs_review": bool(fields.get("needs_review")),
+        "review_reason": fields.get("review_reason"),
+    })
+    # One line per profile saying what was taken as the name and why, so a
+    # bad detection can be traced in the run log without opening the file.
+    print(
+        f"NAME {_label_from_source(source)}: {fields.get('name_display')!r} -> "
+        f"first={fields['first_name']!r} last={fields['last_name']!r} "
+        f"confidence={fields.get('name_confidence', 0):.2f} via {fields.get('name_method')}"
+        + (f" | REVIEW: {fields.get('review_reason')}" if fields.get("needs_review") else "")
+    )
+    if args.debug or fields.get("needs_review"):
+        for line in fields.get("name_evidence") or []:
+            print(f"      {line}")
     key = _cloudflare_key_for(
         docx_parse_path,
         digest,
@@ -679,6 +713,10 @@ def _process_one(
         "city": fields.get("city"),
         "state_code": fields.get("state_code"),
     })
+
+    if base["needs_review"] and not args.insert_unverified:
+        # Do not write an unverified name to Neon; leave the DOCX for review.
+        return {**base, "status": "needs_review"}
 
     if args.dry_run:
         return {**base, "status": "would_process"}
@@ -766,6 +804,7 @@ def run(args: argparse.Namespace) -> dict:
     remote_input = _is_remote_input(args.input)
     manifest_path = _optional_local_path(args.manifest, None if remote_input else DEFAULT_PROCESS_MANIFEST)
     upload_log_path = _optional_local_path(args.upload_log, None if remote_input else DEFAULT_UPLOAD_LOG)
+    review_log_path = _optional_local_path(args.review_log, DEFAULT_REVIEW_LOG)
 
     if remote_input:
         if args.output_dir:
@@ -816,7 +855,7 @@ def run(args: argparse.Namespace) -> dict:
         _ensure_target_table(engine, args.target_table)
         print(f'Target table: "{args.target_table}"')
 
-    stats = {"processed": 0, "skipped": 0, "failed": 0, "total": len(required)}
+    stats = {"processed": 0, "needs_review": 0, "skipped": 0, "failed": 0, "total": len(required)}
     started = monotonic()
     worker_count = max(1, min(args.workers, len(required) or 1))
     if required:
@@ -839,6 +878,11 @@ def run(args: argparse.Namespace) -> dict:
                 _append_upload_log(upload_log_path, record)
             profile_note = f" -> {record.get('profile_id')}" if record.get("profile_id") else ""
             print(f"[{index}/{len(required)}] {status.upper()} {record.get('label', _label_from_source(source))}{profile_note}")
+        elif status == "needs_review":
+            stats["needs_review"] += 1
+            if review_log_path is not None:
+                _append_manifest(review_log_path, record)
+            print(f"[{index}/{len(required)}] REVIEW {_label_from_source(source)}: {record.get('review_reason')}")
         else:
             stats["skipped"] += 1
             print(f"[{index}/{len(required)}] SKIP {_label_from_source(source)}: {status}")
@@ -899,6 +943,8 @@ def run(args: argparse.Namespace) -> dict:
 
     elapsed = max(monotonic() - started, 0.001)
     print(f"\nSummary: {stats}")
+    if stats["needs_review"] and review_log_path is not None:
+        print(f"{stats['needs_review']} profile(s) held back for name review: {review_log_path}")
     print(f"Elapsed: {elapsed / 60:.1f} min ({len(required) / elapsed:.2f} records/sec)")
     return stats
 
@@ -918,6 +964,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ignore-manifest", action="store_true", help="Do not skip records already marked processed")
     parser.add_argument("--retry-all", action="store_true", help="Retry every discovered record, including previously processed records")
     parser.add_argument("--force-convert", action="store_true", help="Regenerate DOCX even if it already exists")
+    parser.add_argument("--reuse-stale-docx", action="store_true", help="Reuse an existing DOCX even if an older converter wrote it (default: rebuild it)")
+    parser.add_argument("--insert-unverified", action="store_true", help="Insert profiles whose name could not be verified instead of holding them for review")
+    parser.add_argument("--review-log", default=None, help=f'JSONL of profiles held for name review. Use "none" to disable; default: {DEFAULT_REVIEW_LOG.name}')
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE, help="Env file path, relative to this script by default")
     parser.add_argument("--no-save-credentials", action="store_true", help="Do not offer to save prompted credentials")
     parser.add_argument("--install-deps", action="store_true", help="Install missing Python packages, then continue")

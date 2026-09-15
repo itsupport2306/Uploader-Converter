@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from getpass import getpass
 from pathlib import Path
@@ -19,6 +20,9 @@ from urllib.parse import urlparse
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import profile_name  # shared person-name detector (also used by the converter)
 SUPPORTED = {".pdf", ".docx"}
 DEFAULT_PREFIX = "resumes/import"
 DEFAULT_MANIFEST = "data_upload_manifest.jsonl"
@@ -322,13 +326,72 @@ def extract_text(path: Path) -> str:
 
 
 def extract_docx_text_bytes(data: bytes) -> str:
+    return extract_docx_profile_bytes(data).text
+
+
+@dataclass
+class DocxProfile:
+    """A DOCX read with its structure, not just its text.
+
+    ``title`` is the first large bold paragraph (how the converter renders the
+    person's name), ``meta`` is the name detection the converter stored in the
+    core properties, and ``converter_version`` says which converter wrote the
+    file so a stale one can be rebuilt.
+    """
+    text: str
+    title: str | None = None
+    meta: dict | None = None
+    converter_version: str | None = None
+
+    @property
+    def is_stale(self) -> bool:
+        return self.converter_version != CONVERTER_VERSION_EXPECTED
+
+
+# Kept in sync with screenshot_to_word.CONVERTER_VERSION; set by the caller
+# (complete_process) once the converter module is loaded.
+CONVERTER_VERSION_EXPECTED: str | None = None
+
+TITLE_MIN_PT = 18  # the converter renders the name at 22pt bold
+
+
+def extract_docx_profile_bytes(data: bytes) -> DocxProfile:
     docx = _import_or_exit("docx")
     doc = docx.Document(io.BytesIO(data))
-    lines = [p.text for p in doc.paragraphs]
+    lines = []
+    title = None
+    for para in doc.paragraphs:
+        lines.append(para.text)
+        if title is None and para.text.strip():
+            sizes = [run.font.size.pt for run in para.runs if run.font.size is not None]
+            if sizes and max(sizes) >= TITLE_MIN_PT and any(run.bold for run in para.runs):
+                title = para.text.strip()
     for table in doc.tables:
         for row in table.rows:
             lines.append(" ".join(c.text for c in row.cells))
-    return "\n".join(lines)
+
+    meta = None
+    version = None
+    try:
+        props = doc.core_properties
+        if (props.category or "").startswith(profile_name_DOCX_TAG):
+            version = (props.category or "").split(" ", 1)[1].strip() or None
+        raw = props.comments or ""
+        if raw.startswith("{"):
+            parsed = json.loads(raw)
+            if parsed.get("tag") == profile_name_DOCX_TAG:
+                meta = parsed
+                version = version or parsed.get("v")
+    except (ValueError, AttributeError):
+        meta = None
+    return DocxProfile("\n".join(lines), title=title, meta=meta, converter_version=version)
+
+
+def extract_docx_profile(path: Path) -> DocxProfile:
+    return extract_docx_profile_bytes(path.read_bytes())
+
+
+profile_name_DOCX_TAG = "screenshot_to_word"
 
 
 def classify_provider(profession_type=None, specialty=None, headline=None, title=None) -> str:
@@ -365,15 +428,58 @@ def _name_from_filename(path: Path) -> tuple[str, str]:
     return "Unknown", "Candidate"
 
 
+def detect_person_name(text: str, path: Path, docx: "DocxProfile | None" = None) -> profile_name.NameDetection:
+    """Find the person's name from every independent source and score them.
+
+    Sources: the converter's own detection stored in the DOCX (layout + page
+    copy + filename, judged on the image), the DOCX title paragraph (large
+    bold text), the first text lines above the first section heading, and
+    the filename. A candidate that is not shaped like a person's name
+    (institution, specialty, section title) can never win, and the result
+    says how confident it is and why.
+    """
+    cands: list[profile_name.NameCandidate] = []
+    meta = (docx.meta if docx else None) or {}
+    if meta.get("display"):
+        weight = min(0.8, float(meta.get("confidence") or 0.0))
+        c = profile_name.NameCandidate("converter", str(meta["display"]), weight)
+        c.reason = f"converter {meta.get('v')} via {meta.get('method')}" if c.valid else c.reason
+        cands.append(c)
+    if docx and docx.title:
+        cands.append(profile_name.NameCandidate("docx_title", docx.title, 0.6))
+
+    # Plain text: only the header lines count, and only when the DOCX has no
+    # title paragraph (the title *is* the first line, so scanning would just
+    # re-read it). A name never appears below the first section heading, so
+    # stop there rather than scanning the résumé.
+    found = 0
+    header_lines = [] if (docx and docx.title) else text.splitlines()[:12]
+    for line in (ln.strip() for ln in header_lines):
+        if not line:
+            continue
+        if profile_name.is_section_heading(line):
+            break
+        if EMAIL_RE.search(line) or PHONE_RE.search(line):
+            continue
+        c = profile_name.NameCandidate("text_line", line, 0.4)
+        if c.valid:
+            cands.append(c)
+            found += 1
+            if found >= 2:
+                break
+        elif found == 0 and len(cands) < 6:
+            cands.append(c)          # keep the rejection in the evidence trail
+    fname = profile_name.name_from_source_name(path.name)
+    cands.append(profile_name.NameCandidate("filename", " ".join(fname) if fname else path.stem, 0.3 if fname else 0.0))
+    return profile_name.detect_name(cands)
+
+
 def _guess_name(text: str, path: Path) -> tuple[str, str]:
-    for line in (ln.strip() for ln in text.splitlines()[:10]):
-        name = _name_from_comma_header(line)
-        if name:
-            return name
-        name = _candidate_name_from_line(line)
-        if name:
-            return name
-    return _name_from_filename(path)
+    """Back-compat wrapper: the best name, or a placeholder when none is credible."""
+    det = detect_person_name(text, path)
+    if det.first and det.last:
+        return det.first, det.last
+    return "Unknown", "Candidate"
 
 
 def _detect(text_lower: str, vocab: dict[str, list[str]]) -> str | None:
@@ -454,7 +560,8 @@ def _bad_name(first: str | None, last: str | None) -> bool:
             return True
         if len(w) >= 12 and any(sub in w for sub in _JUNK_SUBSTRINGS):
             return True
-    return False
+    ok, _ = profile_name.validate_name_tokens([_clean_text(first), _clean_text(last)])
+    return not ok
 
 
 def _title_city(value: str | None) -> str | None:
@@ -637,14 +744,28 @@ def _extract_years(text: str, fallback: int | None = None) -> int:
     return max(matches) if matches else value
 
 
-def format_resume_fields(fields: dict, text: str, path: Path) -> dict:
+def format_resume_fields(fields: dict, text: str, path: Path, docx: "DocxProfile | None" = None) -> dict:
     out = dict(fields)
-    first, last = _guess_name(text, path)
-    if first and last and _bad_name(out.get("first_name"), out.get("last_name")):
-        out["first_name"], out["last_name"] = first[:100], last[:100]
-    else:
+    detection = detect_person_name(text, path, docx)
+    structured_ok = not _bad_name(out.get("first_name"), out.get("last_name"))
+    if detection.first and detection.last:
+        out["first_name"], out["last_name"] = detection.first[:100], detection.last[:100]
+    elif structured_ok:
+        # The header parse alone: kept, but flagged because nothing confirmed it.
         out["first_name"] = (_title_words(out.get("first_name")) or "Unknown")[:100]
         out["last_name"] = (_title_words(out.get("last_name")) or "Provider")[:100]
+        detection.needs_review = True
+        detection.reason = detection.reason or "structured header parse could not be cross-checked"
+    else:
+        out["first_name"], out["last_name"] = "Unknown", "Provider"
+    out["name_display"] = detection.display
+    out["name_confidence"] = detection.confidence
+    out["name_method"] = detection.method
+    out["name_evidence"] = list(detection.evidence)
+    out["needs_review"] = bool(detection.needs_review or _bad_name(out["first_name"], out["last_name"]))
+    out["review_reason"] = detection.reason or (
+        "name failed validation" if out["needs_review"] else None
+    )
 
     email_m = EMAIL_RE.search(text)
     phone_m = PHONE_RE.search(text)
@@ -714,7 +835,7 @@ def _looks_structured(lines: list[str]) -> bool:
     )
 
 
-def parse_structured(text: str, path: Path) -> dict:
+def parse_structured(text: str, path: Path, docx: "DocxProfile | None" = None) -> dict:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     first, last, profession = _strip_credentials(lines[0]) if lines else ("Unknown", "Provider", None)
 
@@ -813,13 +934,13 @@ def parse_structured(text: str, path: Path) -> dict:
         "american_board": primary_american_board(board_certs),
         "provider_category": classify_provider(prof, specialty, headline),
     }
-    return format_resume_fields(fields, text, path)
+    return format_resume_fields(fields, text, path, docx)
 
 
-def parse_resume(text: str, path: Path) -> dict:
+def parse_resume(text: str, path: Path, docx: "DocxProfile | None" = None) -> dict:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if _looks_structured(lines):
-        return parse_structured(text, path)
+        return parse_structured(text, path, docx)
 
     tl = " " + text.lower() + " "
     first, last = _guess_name(text, path)
@@ -867,13 +988,17 @@ def parse_resume(text: str, path: Path) -> dict:
         "american_board": primary_american_board(certs),
         "provider_category": classify_provider(profession, specialty, headline),
     }
-    return format_resume_fields(fields, text, path)
+    return format_resume_fields(fields, text, path, docx)
 
 
+def parse_resume_smart(text: str, path: Path, docx: "DocxProfile | None" = None) -> dict:
+    """Parse resume fields with local heuristics only.
 
-def parse_resume_smart(text: str, path: Path) -> dict:
-    """Parse resume fields with local heuristics only."""
-    return parse_resume(text, path)
+    ``docx`` (from ``extract_docx_profile``) supplies the DOCX title paragraph
+    and the converter's stored name detection, which are far stronger name
+    evidence than the flattened text.
+    """
+    return parse_resume(text, path, docx)
 
 
 # ---------------------------------------------------------------------------
