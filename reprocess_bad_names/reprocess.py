@@ -1,11 +1,17 @@
 """Re-run the screenshot -> DOCX -> Cloudflare R2 -> Neon flow for profiles whose
-first/last name was mis-detected (contains "university", "assistant" or
-"certified"). Their stored DOCX only holds the certification section, so every
-one is rebuilt from the original PNG.
+first/last name was mis-detected. Candidates are found by asking Qwen to look
+at each profile's stored name/headline/specialty plus an excerpt of its OCR'd
+resume text and flag the ones that look wrong (see qwen_detect.py) -- not by a
+fixed list of bad-name substrings, so it also catches junk that still looks
+like a plausible name ("Class Of", "Samaritan Vie", "Santa Hospital", or a
+name that simply does not match the resume). Their stored DOCX often only
+holds the certification section, so every flagged profile is rebuilt from the
+original PNG.
 
     python reprocess.py --dry-run --limit 3
     python reprocess.py --workers 4
     python reprocess.py --source-root-url "https://radixsol-my.sharepoint.com/..."
+    python reprocess.py --scan-limit 20 --detect-only   # preview what Qwen flags first
 
 Nothing in the parent folder is modified: this script imports
 "complete_process copy.py" (and through it the converter and uploader) and
@@ -40,21 +46,40 @@ ROOT = HERE.parent
 PROCESS_SCRIPT = ROOT / "complete_process copy.py"
 DEFAULT_ENV_FILE = ROOT / "word_profile_pipeline" / ".env"
 DEFAULT_MANIFEST = HERE / "logs" / "reprocess_manifest.jsonl"
+DEFAULT_SCAN_MANIFEST = HERE / "logs" / "qwen_scan_manifest.jsonl"
 DEFAULT_RUN_LOG_DIR = HERE / "logs"
 # Folder name of the OneDrive sync root inside a stored Windows path, e.g.
 #   C:\Users\admin\OneDrive - Radixsol\Physical_A\...\file.png
 # Everything after it is the path inside the drive.
 DEFAULT_SYNC_ROOT_NAME = "OneDrive - Radixsol"
 
+# Legacy candidate selection: a fixed substring match. Kept as an optional,
+# additive signal (--no-term-match to drop it, --term-match-only to use only
+# this and skip the Qwen scan) -- see qwen_detect.py for the primary,
+# model-driven detection this pipeline now uses by default.
 NAME_TERMS = ("university", "assistant", "certified")
 SELECT_SQL = """
     SELECT profile_id, first_name, last_name, resume_url, resume_sections::text
     FROM {table}
-    WHERE first_name ILIKE '%university%' OR last_name ILIKE '%university%'
-       OR first_name ILIKE '%assistant%'  OR last_name ILIKE '%assistant%'
-       OR first_name ILIKE '%certified%'  OR last_name ILIKE '%certified%'
+    WHERE (
+        first_name ILIKE '%university%' OR last_name ILIKE '%university%'
+        OR first_name ILIKE '%assistant%'  OR last_name ILIKE '%assistant%'
+        OR first_name ILIKE '%certified%'  OR last_name ILIKE '%certified%'
+    ){date_filter}
     ORDER BY updated_at NULLS LAST, profile_id
 """
+# Appended to SELECT_SQL / qwen_detect's SELECT_ALL_SQL when --start-date /
+# --end-date (or START_DATE / END_DATE in .env) partition the table so
+# several servers can each own a disjoint created_at slice.
+DATE_FILTER_SQL = " AND created_at BETWEEN :start_date AND :end_date"
+FETCH_BY_IDS_SQL = """
+    SELECT profile_id, first_name, last_name, resume_url, resume_sections::text
+    FROM {table}
+    WHERE profile_id IN ({placeholders})
+    ORDER BY updated_at NULLS LAST, profile_id
+"""
+# Keeps any single IN (...) query to a sane size.
+_ID_CHUNK = 500
 
 
 def _load_module(name: str, path: Path):
@@ -72,6 +97,8 @@ cp = _load_module("complete_process_copy", PROCESS_SCRIPT)
 converter = cp.converter
 uploader = cp.uploader
 DOCX_CT = cp.DOCX_CONTENT_TYPE
+
+import qwen_detect
 
 
 @dataclass(frozen=True)
@@ -149,10 +176,7 @@ def _done_ids(path: Path) -> set[str]:
 # ---------------------------------------------------------------------------
 # Selecting the profiles
 
-def _fetch_bad_profiles(engine, table: str, limit: int | None) -> list[BadProfile]:
-    sql = SELECT_SQL.format(table=cp._quoted_table(table))
-    with engine.connect() as conn:
-        rows = conn.execute(uploader._text(sql)).all()
+def _rows_to_profiles(rows) -> list[BadProfile]:
     profiles: list[BadProfile] = []
     for profile_id, first, last, resume_url, sections_text in rows:
         try:
@@ -162,7 +186,41 @@ def _fetch_bad_profiles(engine, table: str, limit: int | None) -> list[BadProfil
         if not isinstance(sections, dict):
             sections = {}
         profiles.append(BadProfile(str(profile_id), first, last, resume_url, sections))
+    return profiles
+
+
+def _fetch_bad_profiles(
+    engine, table: str, limit: int | None,
+    start_date: str | None = None, end_date: str | None = None,
+) -> list[BadProfile]:
+    """Legacy candidate selection: fixed university/assistant/certified substring match."""
+    params = {}
+    date_filter = ""
+    if start_date and end_date:
+        date_filter = DATE_FILTER_SQL
+        params = {"start_date": start_date, "end_date": end_date}
+    sql = SELECT_SQL.format(table=cp._quoted_table(table), date_filter=date_filter)
+    with engine.connect() as conn:
+        rows = conn.execute(uploader._text(sql), params).all()
+    profiles = _rows_to_profiles(rows)
     return profiles[:limit] if limit else profiles
+
+
+def _fetch_profiles_by_ids(engine, table: str, ids) -> list[BadProfile]:
+    """Full rows for a set of profile_ids (the Qwen scan's flagged candidates)."""
+    ids = list(dict.fromkeys(str(i) for i in ids))  # dedupe, preserve order
+    if not ids:
+        return []
+    profiles: list[BadProfile] = []
+    with engine.connect() as conn:
+        for start in range(0, len(ids), _ID_CHUNK):
+            chunk = ids[start:start + _ID_CHUNK]
+            placeholders = ", ".join(f":id{i}" for i in range(len(chunk)))
+            sql = FETCH_BY_IDS_SQL.format(table=cp._quoted_table(table), placeholders=placeholders)
+            params = {f"id{i}": pid for i, pid in enumerate(chunk)}
+            rows = conn.execute(uploader._text(sql), params).all()
+            profiles.extend(_rows_to_profiles(rows))
+    return profiles
 
 
 # ---------------------------------------------------------------------------
@@ -383,16 +441,67 @@ def _reprocess_one(profile: BadProfile, fetcher: SourceFetcher, engine, args) ->
 
 # ---------------------------------------------------------------------------
 
+def _select_candidate_profiles(engine, args: argparse.Namespace) -> list[BadProfile]:
+    """The profiles to reprocess: Qwen-flagged bad names by default, optionally
+    unioned with the legacy fixed-term match; or the legacy match alone with
+    --term-match-only. When --start-date/--end-date are set, only profiles
+    whose created_at falls in that range are ever considered, so several
+    servers running with disjoint ranges never touch the same rows."""
+    if args.term_match_only:
+        return _fetch_bad_profiles(engine, args.target_table, args.limit, args.start_date, args.end_date)
+
+    try:
+        bad_ids = qwen_detect.scan_for_bad_profiles(
+            engine, args.target_table, uploader, cp,
+            manifest=args.scan_manifest,
+            scan_limit=args.scan_limit,
+            batch_size=args.scan_batch_size,
+            excerpt_chars=args.scan_excerpt_chars,
+            concurrency=args.scan_concurrency,
+            timeout=args.scan_timeout,
+            rescan=args.rescan_all,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+    except qwen_detect.QwenError as exc:
+        raise SystemExit(
+            f"ERROR: Qwen detection pass failed: {exc}\n"
+            "Fix the LLM_* settings in .env (or the model server), or pass "
+            "--term-match-only to fall back to the old university/assistant/"
+            "certified substring match."
+        )
+
+    if not args.no_term_match:
+        bad_ids |= {
+            p.profile_id for p in
+            _fetch_bad_profiles(engine, args.target_table, None, args.start_date, args.end_date)
+        }
+
+    profiles = _fetch_profiles_by_ids(engine, args.target_table, bad_ids)
+    return profiles[:args.limit] if args.limit else profiles
+
+
 def run(args: argparse.Namespace) -> dict:
     uploader._prepare_runtime_env(args)
     uploader._validate_upload_env(args)
 
     engine = uploader._create_engine()
     cp._ensure_target_table(engine, args.target_table)
-    profiles = _fetch_bad_profiles(engine, args.target_table, args.limit)
+
+    if args.start_date and args.end_date:
+        print(f"Partition: only created_at between {args.start_date} and {args.end_date}")
+
+    profiles = _select_candidate_profiles(engine, args)
+
+    if args.detect_only:
+        print(f"\nDetect-only: {len(profiles)} candidate profile(s) (not reprocessed):")
+        for p in profiles:
+            print(f"  {p.profile_id}  {p.label}")
+        return {"processed": 0, "failed": 0, "total": 0, "detected": len(profiles)}
+
     done = set() if args.retry_all else _done_ids(args.manifest)
     todo = [p for p in profiles if p.profile_id not in done]
-    print(f"Matched {len(profiles)} profile(s) with {'/'.join(NAME_TERMS)} in the name; "
+    print(f"{len(profiles)} candidate profile(s) found; "
           f"{len(todo)} to process ({len(profiles) - len(todo)} already done in manifest).")
     if not todo:
         return {"processed": 0, "failed": 0, "total": 0}
@@ -456,6 +565,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-run-log", action="store_true", help="Do not mirror console output to logs/run_<ts>.log")
     parser.add_argument("--target-table", default=None, help='default: TARGET_TABLE from .env, else "profiles"')
 
+    part = parser.add_argument_group("date-range partitioning (split work across servers)")
+    part.add_argument("--start-date", default=None,
+                       help="Only profiles with created_at >= this (default: START_DATE from .env). "
+                            "Format: 'YYYY-MM-DD HH:MM:SS'. Requires --end-date.")
+    part.add_argument("--end-date", default=None,
+                       help="Only profiles with created_at <= this (default: END_DATE from .env). "
+                            "Format: 'YYYY-MM-DD HH:MM:SS'. Requires --start-date.")
+
+    scan = parser.add_argument_group("Qwen bad-name detection")
+    scan.add_argument("--scan-limit", type=int, default=None,
+                       help="Only classify the first N profiles with Qwen (default: scan every profile)")
+    scan.add_argument("--scan-batch-size", type=int, default=None,
+                       help="Profiles per Qwen classification call (default: 8, or QWEN_SCAN_BATCH_SIZE)")
+    scan.add_argument("--scan-excerpt-chars", type=int, default=None,
+                       help="OCR text characters shown to Qwen per profile (default: 800, or QWEN_SCAN_EXCERPT_CHARS)")
+    scan.add_argument("--scan-concurrency", type=int, default=None,
+                       help="Parallel Qwen scan calls (default: LLM_MAX_CONCURRENCY from .env, else 1)")
+    scan.add_argument("--scan-timeout", type=int, default=None,
+                       help="Seconds per Qwen scan call (default: LLM_TIMEOUT_SECONDS from .env, else 180)")
+    scan.add_argument("--scan-manifest", default=str(DEFAULT_SCAN_MANIFEST),
+                       help="Cache of already-classified profile_ids, so a re-run only scans new ones")
+    scan.add_argument("--rescan-all", action="store_true",
+                       help="Ignore --scan-manifest and reclassify every profile with Qwen")
+    scan.add_argument("--no-term-match", action="store_true",
+                       help="Do not also include the legacy university/assistant/certified substring match")
+    scan.add_argument("--term-match-only", action="store_true",
+                       help="Skip the Qwen scan entirely; use only the legacy substring match")
+    scan.add_argument("--detect-only", action="store_true",
+                       help="Run detection and list the flagged profiles; do not reprocess anything")
+
     src = parser.add_argument_group("source image location")
     src.add_argument("--sync-root-name", default=DEFAULT_SYNC_ROOT_NAME,
                      help="Folder name in stored paths that marks the OneDrive root")
@@ -481,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     args.manifest = Path(args.manifest).expanduser()
+    args.scan_manifest = Path(args.scan_manifest).expanduser()
     if not Path(args.env_file).expanduser().is_absolute():
         args.env_file = str((HERE / args.env_file).resolve())
 
@@ -495,6 +635,29 @@ def main(argv: list[str] | None = None) -> int:
     args.source_root_url = args.source_root_url or env("REPROCESS_SOURCE_ROOT_URL")
     args.source_user = args.source_user or env("REPROCESS_SOURCE_USER")
     args.local_root = args.local_root or env("REPROCESS_LOCAL_ROOT")
+    args.scan_batch_size = args.scan_batch_size or int(env("QWEN_SCAN_BATCH_SIZE", "8") or 8)
+    args.scan_excerpt_chars = args.scan_excerpt_chars or int(env("QWEN_SCAN_EXCERPT_CHARS", "800") or 800)
+    args.scan_concurrency = args.scan_concurrency or int(env("LLM_MAX_CONCURRENCY", "1") or 1)
+    args.scan_timeout = args.scan_timeout or int(env("LLM_TIMEOUT_SECONDS", "180") or 180)
+    args.start_date = (args.start_date or env("START_DATE") or "").strip() or None
+    args.end_date = (args.end_date or env("END_DATE") or "").strip() or None
+    if bool(args.start_date) != bool(args.end_date):
+        raise SystemExit(
+            "ERROR: --start-date and --end-date (or START_DATE/END_DATE in .env) "
+            "must be set together."
+        )
+    if args.start_date and args.end_date:
+        parsed = {}
+        for label, value in (("--start-date", args.start_date), ("--end-date", args.end_date)):
+            try:
+                parsed[label] = datetime.fromisoformat(value)
+            except ValueError:
+                raise SystemExit(
+                    f"ERROR: {label} value {value!r} is not a valid timestamp "
+                    "(expected 'YYYY-MM-DD HH:MM:SS')."
+                )
+        if parsed["--start-date"] > parsed["--end-date"]:
+            raise SystemExit("ERROR: --start-date must not be after --end-date.")
     if args.workers < 1:
         raise SystemExit("ERROR: --workers must be 1 or greater.")
 
